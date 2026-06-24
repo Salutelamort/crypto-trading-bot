@@ -149,12 +149,22 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
         test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[cut:])
         return train_m, test_m, 0.0
 
+    total_trades = sum(r["num_trades"] for r in results)
+    traded = [r for r in results if r["num_trades"] > 0]  # окна, где были сделки
+
+    # Агент, который НЕ торгует в out-of-sample, бесполезен → худший балл, не 0.0.
+    if total_trades == 0 or not traded:
+        test_m = {"sharpe": -99.0, "total_return": 0.0, "win_rate": 0.0,
+                  "num_trades": 0, "max_drawdown": 0.0}
+        return train_m, test_m, 0.0
+
     test_m = {
-        "sharpe": round(float(np.mean([r["sharpe"] for r in results])), 3),
-        "total_return": round(float(np.mean([r["total_return"] for r in results])), 4),
-        "win_rate": round(float(np.mean([r["win_rate"] for r in results])), 3),
-        "num_trades": int(sum(r["num_trades"] for r in results)),
-        "max_drawdown": round(float(max(r["max_drawdown"] for r in results)), 4),
+        "sharpe": round(float(np.mean([r["sharpe"] for r in traded])), 3),
+        "total_return": round(float(np.mean([r["total_return"] for r in traded])), 4),
+        "win_rate": round(float(np.mean([r["win_rate"] for r in traded])), 3),
+        "num_trades": int(total_trades),
+        "max_drawdown": round(float(max(r["max_drawdown"] for r in traded)), 4),
     }
-    robustness = round(sum(1 for r in results if r["total_return"] > 0) / len(results), 3)
+    # устойчивость = доля ТОРГОВАВШИХ окон, которые были прибыльны
+    robustness = round(sum(1 for r in traded if r["total_return"] > 0) / len(traded), 3)
     return train_m, test_m, robustness

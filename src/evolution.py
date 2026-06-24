@@ -27,9 +27,13 @@ from . import metrics as mt
 
 
 def _fitness(agent, min_trades):
-    """Фитнес для отбора = train_sharpe, но стратегии с малым числом сделок
-    отбраковываются (одна удачная сделка не должна давать высокий Sharpe)."""
+    """Фитнес для отбора = train_sharpe (in-sample, без утечки), НО непригодны:
+    - мало сделок в обучении (одна удачная не должна давать высокий Sharpe);
+    - НОЛЬ сделок в свежих данных (OOS) — стратегия мертва на актуальном рынке,
+      такие не должны выживать и размножаться (это и есть 'бесполезные' агенты)."""
     if (agent["train_trades"] or 0) < min_trades:
+        return -999.0
+    if (agent["test_trades"] or 0) == 0:
         return -999.0
     return agent["train_sharpe"] if agent["train_sharpe"] is not None else -99.0
 
