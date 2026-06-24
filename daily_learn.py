@@ -26,17 +26,13 @@ HEADER = ["date", "equity", "capital", "open_positions",
           "fear_greed", "news_hits"]
 
 
-def _record_row(conn, cfg):
-    """Один цикл: отбор + тик + запись строки в журнал (с временной меткой)."""
-    supervisor.supervise(conn, cfg)
-    live_trade.tick(conn, cfg)
-
+def _journal(conn, cfg):
+    """Записывает строку в журнал (только чтение метрик, без побочных действий).
+    best = лучший найденный OOS Sharpe среди ВСЕХ агентов (показывает прогресс поиска)."""
     capital, equity, npos = live_trade.account_equity(conn, cfg)
     cand = len(db.get_agents(conn, "candidate"))
     prom = len(db.get_agents(conn, "promoted"))
-    row_best = conn.execute(
-        "SELECT MAX(test_sharpe) m FROM agents WHERE status IN ('candidate','promoted')"
-    ).fetchone()["m"]
+    best = conn.execute("SELECT MAX(test_sharpe) m FROM agents").fetchone()["m"]
     try:
         bias = macro_feed.etf_flow_bias(cfg.get("macro", {}).get("asset", "BTC"))["bias"]
     except Exception:  # noqa
@@ -49,16 +45,15 @@ def _record_row(conn, cfg):
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
     row = [ts, round(equity, 2), round(capital, 2), npos, cand, prom,
-           round(row_best, 3) if row_best is not None else "", bias, fng, nhits]
-
+           round(best, 3) if best is not None else "", bias, fng, nhits]
     new_file = not os.path.exists(CSV_PATH)
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new_file:
             w.writerow(HEADER)
         w.writerow(row)
-    print(f"[{ts}] капитал {equity:,.2f} | кандидатов {cand} | "
-          f"продвинуто {prom} | лучший Sharpe {row_best if row_best is not None else '—'}")
+    print(f"[{ts}] лучший Sharpe {best if best is not None else '—'} | "
+          f"кандидатов {cand} | продвинуто {prom} | капитал {equity:,.0f}")
 
 
 def main():
@@ -71,20 +66,24 @@ def main():
     deadline = time.time() + budget_min * 60
 
     print(f"== Автообучение (пачка, бюджет {budget_min} мин) ==")
-    # данные тянем один раз в начале прогона
     for sym in cfg["symbols"]:
         feed.fetch_ohlcv(conn, sym, cfg["timeframe"], cfg["history_days"])
     data = {s: feed.load_ohlcv(conn, s, cfg["timeframe"]) for s in cfg["symbols"]}
     data = {s: d for s, d in data.items() if not d.empty}
 
+    # Цикл: эволюция накапливает и улучшает популяцию (рождение/смерть внутри неё).
     cycles = 0
     while True:
-        evolution.evolve(conn, cfg, data)   # рождение/смерть агентов
-        _record_row(conn, cfg)              # отбор + тик + журнал
+        evolution.evolve(conn, cfg, data)
+        _journal(conn, cfg)
         cycles += 1
         if time.time() >= deadline:
             break
 
+    # Допуск к живой торговле (без убийства) + один тик бумажной торговли.
+    supervisor.supervise(conn, cfg)
+    live_trade.tick(conn, cfg)
+    _journal(conn, cfg)
     print(f"\nГотово: циклов эволюции за прогон — {cycles}")
     conn.close()
 

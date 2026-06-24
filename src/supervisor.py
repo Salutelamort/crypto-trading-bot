@@ -41,18 +41,12 @@ def _decide(agents, cfg, quarantined):
         cons = s["consistency"] or 0.0
         trades = s["test_trades"] or 0
 
-        # --- СМЕРТЬ (своя группа метрик) ---
-        if dd > sup["kill_max_drawdown"]:
-            decisions.append((a["id"], "kill",
-                f"просадка {dd:.0%} > лимита {sup['kill_max_drawdown']:.0%}"))
-            continue
-        if cons < sup["kill_min_consistency"]:
-            decisions.append((a["id"], "kill",
-                f"неустойчив: прибыльных walk-forward окон {cons:.0%} "
-                f"< {sup['kill_min_consistency']:.0%}"))
-            continue
+        # СМЕРТЬ агентов происходит ВНУТРИ эволюции (отбор по приспособленности
+        # в evolution.py). Здесь супервизор НЕ убивает — только ДОПУСКАЕТ к живой
+        # торговле тех, кто стабильно показал преимущество. Так популяция
+        # накапливается и улучшается между циклами.
 
-        # --- ДОПУСК к живой торговле (другая группа метрик) ---
+        # --- ДОПУСК к живой торговле ---
         max_dd_ok = dd <= sup.get("promote_max_drawdown", 1.0)
         ok = (ts >= sup["promote_min_sharpe"]
               and trades >= sup["promote_min_trades"]
