@@ -117,6 +117,19 @@ def tick(conn, cfg, verbose=True):
             pass
 
     positions = _load_positions(conn)
+    interval = cfg.get("live", {}).get("interval_seconds", 300)
+    n_min = max(2, int(interval / 60) + 1)  # сколько 1m-баров покрывают паузу между тиками
+    minute_cache = {}
+
+    def minute_hl(sym, fallback_price):
+        """High/Low по 1m-свечам с прошлого тика — для внутрибарного стопа."""
+        if sym not in minute_cache:
+            try:
+                md = feed.fetch_recent(sym, "1m", n_min + 2).tail(n_min)
+                minute_cache[sym] = (float(md["high"].max()), float(md["low"].min()))
+            except Exception:  # noqa
+                minute_cache[sym] = (fallback_price, fallback_price)
+        return minute_cache[sym]
 
     # свежие данные по уникальным символам
     symbols = {a["symbol"] for a in agents}
@@ -157,13 +170,14 @@ def tick(conn, cfg, verbose=True):
         sig = int(gn.signal(g, df).shift(delay).fillna(0).iloc[-1])
         pos = positions.get(aid)
 
-        # 1. управление позицией
+        # 1. управление позицией — внутрибарно по 1m свечам (стоп как реальный ордер)
         if pos is not None:
-            should_exit, reason = pos.exit_check(price, risk_cfg)
+            hi, lo = minute_hl(sym, price)
+            should_exit, reason, exit_price = pos.exit_check_hl(hi, lo, price, risk_cfg)
             if not should_exit and sig == 0:
-                should_exit, reason = True, "signal"
+                should_exit, reason, exit_price = True, "signal", price
             if should_exit:
-                fill = price * (1 - slip)
+                fill = exit_price * (1 - slip)
                 proceeds = pos.units * fill * (1 - fee)
                 pnl = proceeds - pos.units * pos.entry_price
                 capital += proceeds

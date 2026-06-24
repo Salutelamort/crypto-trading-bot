@@ -34,12 +34,19 @@ def _fitness(agent, min_trades):
     return agent["train_sharpe"] if agent["train_sharpe"] is not None else -99.0
 
 
-def _evaluate(genome, train_df, test_df, cfg):
-    """Бэктест агента на train и test, расчёт consistency."""
-    train_m = bt.run(genome, train_df, cfg)
-    test_m = bt.run(genome, test_df, cfg)
-    cons = mt.consistency(train_m["win_rate"], test_m["win_rate"])
-    return train_m, test_m, cons
+def _evaluate(genome, df, cfg):
+    """Walk-forward оценка агента. consistency = доля прибыльных OOS окон."""
+    return bt.walk_forward_eval(genome, df, cfg)
+
+
+def _proven_symbols(conn, cfg, symbols):
+    """Символы с ДОКАЗАННЫМ преимуществом (как у piratastuertos): где хоть один
+    агент показал OOS Sharpe выше порога. Пока таких нет — возвращаем все (bootstrap)."""
+    bar = cfg["evolution"].get("proven_min_sharpe", 0.0)
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM agents WHERE test_sharpe > ?", (bar,)).fetchall()
+    proven = {r["symbol"] for r in rows} & set(symbols)
+    return sorted(proven) if proven else symbols
 
 
 def _anti_clone(conn, cfg):
@@ -98,27 +105,32 @@ def evolve(conn, cfg, data_by_symbol):
         survivors = sorted(alive, key=lambda a: _fitness(a, min_tr),
                            reverse=True)[:ev["survivors"]]
 
+        # Генерируем новых ТОЛЬКО на символах с доказанным преимуществом
+        # (как piratastuertos). Пока таких нет — по всем (фаза bootstrap).
+        gen_symbols = symbols
+        if ev.get("restrict_to_proven"):
+            gen_symbols = _proven_symbols(conn, cfg, symbols)
+
         new_genomes = []
-        # мутации выживших
+        # мутации выживших (символ сохраняется)
         for s in survivors:
             for _ in range(ev["mutations_per_survivor"]):
                 new_genomes.append(gn.mutate(json.loads(s["genome"]), rng))
-        # добиваем случайными
+        # добиваем случайными на проверенных символах
         while len(new_genomes) < need:
-            sym = rng.choice(symbols)
+            sym = rng.choice(gen_symbols)
             new_genomes.append(gn.random_genome(sym, cfg["timeframe"], rng))
         new_genomes = new_genomes[:max(need, 0)]
 
-        # 2. Оцениваем новых кандидатов на train+test.
+        # 2. Оцениваем новых кандидатов через walk-forward.
         for g in new_genomes:
             sym = g["symbol"]
             if sym not in data_by_symbol:
                 continue
-            train_df, test_df = bt.split_train_test(
-                data_by_symbol[sym], cfg["train_ratio"])
-            if len(train_df) < 200 or len(test_df) < 80:
+            df = data_by_symbol[sym]
+            if len(df) < 400:
                 continue
-            train_m, test_m, cons = _evaluate(g, train_df, test_df, cfg)
+            train_m, test_m, cons = _evaluate(g, df, cfg)
             aid = db.insert_agent(conn, g, sym, cfg["timeframe"])
             db.update_agent_metrics(conn, aid, train_m, test_m, cons)
 

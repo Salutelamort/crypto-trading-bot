@@ -34,6 +34,25 @@ class Position:
             return True, "take_profit"
         return False, None
 
+    def exit_check_hl(self, high, low, price, risk_cfg):
+        """
+        Внутрибарная проверка по экстремумам (high/low) — для живого режима, чтобы
+        стоп срабатывал на движениях МЕЖДУ тиками, как настоящий резервный ордер,
+        а не только по цене закрытия. Возвращает (надо_выходить, причина, цена_выхода).
+        """
+        self.update_peak(high)
+        stop = self.entry_price * (1 - risk_cfg["stop_loss_pct"])
+        trail = self.peak_price * (1 - risk_cfg["trailing_stop_pct"])
+        take = self.entry_price * (1 + risk_cfg["take_profit_pct"])
+        effective_stop = max(stop, trail)
+
+        # стоп приоритетнее тейка (консервативно — сначала защита от убытка)
+        if low <= effective_stop:
+            return True, ("stop_loss" if effective_stop == stop else "trailing"), effective_stop
+        if high >= take:
+            return True, "take_profit", take
+        return False, None, price
+
 
 def position_size(capital: float, risk_cfg: dict) -> float:
     """Сколько денег вложить в одну позицию (доля капитала)."""

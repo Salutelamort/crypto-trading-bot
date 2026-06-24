@@ -16,10 +16,12 @@ from . import genome as gn
 from . import metrics as mt
 
 
-def run(genome: dict, df: pd.DataFrame, cfg: dict) -> dict:
+def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     """
     Симулирует одного агента на исторических данных.
     Возвращает словарь метрик + кривую equity.
+    sig — необязательный готовый сигнал (для walk-forward, чтобы не терять прогрев
+    индикаторов на границах окон). Если None — считается из генома.
     """
     risk = cfg["risk"]
     costs = cfg["costs"]
@@ -28,8 +30,11 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict) -> dict:
 
     # Задержка исполнения: реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не мгновенно).
     # Это убирает зависимость стратегии от скорости доступа к бирже.
-    delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
-    sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
+    if sig is None:
+        delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+        sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
+    else:
+        sig = sig.reindex(df.index).fillna(0).astype(int)
     close = df["close"].values
     high = df["high"].values
     low = df["low"].values
@@ -105,3 +110,51 @@ def split_train_test(df: pd.DataFrame, train_ratio: float):
     """Разделение на in-sample / out-of-sample. Агент при отборе видит только train."""
     cut = int(len(df) * train_ratio)
     return df.iloc[:cut], df.iloc[cut:]
+
+
+def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
+    """
+    WALK-FORWARD валидация (совет из треда против переобучения).
+
+    Первая половина данных = in-sample (фитнес отбора). Вторая половина режется
+    на N окон, и агент проверяется в КАЖДОМ окне отдельно. Хорошая стратегия
+    прибыльна в большинстве окон, а не в одном удачном.
+
+    Возвращает (train_metrics, test_metrics_aggregated, robustness), где
+    robustness = доля out-of-sample окон с положительной доходностью (0..1).
+    Эта robustness используется как метрика consistency при отборе.
+    """
+    import numpy as np
+    delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+    full_sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
+
+    cut = int(len(df) * cfg["train_ratio"])
+    train_df = df.iloc[:cut]
+    oos_df = df.iloc[cut:]
+
+    train_m = run(genome, train_df, cfg, sig=full_sig.iloc[:cut])
+
+    nwin = cfg.get("validation", {}).get("walk_forward_windows", 4)
+    idx = list(range(len(oos_df)))
+    windows = [w for w in np.array_split(idx, nwin) if len(w) >= 50]
+
+    results = []
+    for w in windows:
+        a, b = int(w[0]), int(w[-1]) + 1
+        seg = oos_df.iloc[a:b]
+        seg_sig = full_sig.iloc[cut + a:cut + b]
+        results.append(run(genome, seg, cfg, sig=seg_sig))
+
+    if not results:  # данных мало — откат на единый OOS
+        test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[cut:])
+        return train_m, test_m, 0.0
+
+    test_m = {
+        "sharpe": round(float(np.mean([r["sharpe"] for r in results])), 3),
+        "total_return": round(float(np.mean([r["total_return"] for r in results])), 4),
+        "win_rate": round(float(np.mean([r["win_rate"] for r in results])), 3),
+        "num_trades": int(sum(r["num_trades"] for r in results)),
+        "max_drawdown": round(float(max(r["max_drawdown"] for r in results)), 4),
+    }
+    robustness = round(sum(1 for r in results if r["total_return"] > 0) / len(results), 3)
+    return train_m, test_m, robustness
