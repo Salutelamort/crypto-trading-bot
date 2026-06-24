@@ -1,153 +1,62 @@
 """
-Веб-дашборд торгового бота. Принцип из треda: трейдеры строят локальный
-дашборд, чтобы визуально проверять сделки и решения (veritas7411, Flying8ball).
+ПАНЕЛЬ-НАБЛЮДАТЕЛЬ за облачным обучением.
 
-Запуск:
-    python dashboard.py
-Затем открой в браузере:  http://127.0.0.1:5000
+Только наблюдение, никаких кнопок управления. Обучение идёт само в облаке
+(GitHub Actions каждые 15 минут). Панель раз в ~90 секунд подтягивает свежее
+состояние из облака (git pull) и показывает его в реальном времени:
+прогресс обучения, агентов, решения эволюции, сделки, макро/новостной фон.
 
-Возможности:
-- Кнопки запуска: Fetch / Evolve / Supervise / Paper / Run All — прямо из браузера.
-- Живой лог выполнения.
-- Таблицы агентов (продвинутые / кандидаты / убитые), решения супервизора, сделки.
-- Макро-статус (потоки в ETF, risk-on/off) с кэшем.
-Всё локально, никаких ключей. Торговля остаётся детерминированной.
+Запуск: python dashboard.py  →  http://127.0.0.1:5000
 """
-import io
+import os
+import csv
 import json
 import time
 import threading
-import contextlib
+import subprocess
 
 import yaml
-from flask import Flask, jsonify, render_template_string, abort
+from flask import Flask, jsonify, render_template_string
 
-from src import db
-from src import data_feed as feed
-from src import evolution, supervisor, paper_trade, macro_feed, live_trade, news_feed
+from src import db, macro_feed, news_feed
 
 app = Flask(__name__)
-CFG = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CFG = yaml.safe_load(open(os.path.join(ROOT, "config.yaml"), encoding="utf-8"))
 
-# --- состояние фоновой задачи ---
-TASK = {"running": False, "name": None, "log": [], "finished_at": None}
-_LOCK = threading.Lock()
-
-# --- кэш макро (farside дёргать раз в 5 мин, не на каждый рефреш) ---
 _MACRO = {"ts": 0, "data": None}
-
-# --- состояние живой торговли (отдельный фоновый цикл) ---
-LIVE = {"running": False, "stop": False, "log": []}
-
-
-class _LiveLog(io.TextIOBase):
-    def write(self, s):
-        if s.strip():
-            LIVE["log"].append(s.rstrip("\n"))
-            LIVE["log"][:] = LIVE["log"][-100:]
-        return len(s)
-
-
-def _live_loop():
-    conn = db.connect(CFG["db_path"])
-    interval = CFG.get("live", {}).get("interval_seconds", 300)
-    writer = _LiveLog()
-    while not LIVE["stop"]:
-        try:
-            with contextlib.redirect_stdout(writer):
-                live_trade.tick(conn, CFG)
-        except Exception as e:  # noqa
-            LIVE["log"].append(f"[ошибка] {type(e).__name__}: {e}")
-        slept = 0
-        while slept < interval and not LIVE["stop"]:
-            time.sleep(2)
-            slept += 2
-    conn.close()
-    LIVE["running"] = False
-    LIVE["log"].append("⏹ Живая торговля остановлена.")
-
-
-class _LogWriter(io.TextIOBase):
-    """Перехватывает print из модулей в лог задачи."""
-    def write(self, s):
-        if s.strip():
-            TASK["log"].append(s.rstrip("\n"))
-            TASK["log"][:] = TASK["log"][-300:]
-        return len(s)
-
-
-def _load_data(conn):
-    data = {}
-    for sym in CFG["symbols"]:
-        df = feed.load_ohlcv(conn, sym, CFG["timeframe"])
-        if not df.empty:
-            data[sym] = df
-    return data
-
-
-def _run_task(name):
-    """Выполняет команду в фоне со свежим соединением SQLite."""
-    conn = db.connect(CFG["db_path"])
-    writer = _LogWriter()
-    try:
-        with contextlib.redirect_stdout(writer):
-            if name == "fetch":
-                for sym in CFG["symbols"]:
-                    feed.fetch_ohlcv(conn, sym, CFG["timeframe"], CFG["history_days"])
-            elif name == "evolve":
-                evolution.evolve(conn, CFG, _load_data(conn))
-            elif name == "supervise":
-                supervisor.supervise(conn, CFG)
-            elif name == "paper":
-                paper_trade.run_paper(conn, CFG, _load_data(conn))
-            elif name == "run":
-                for sym in CFG["symbols"]:
-                    feed.fetch_ohlcv(conn, sym, CFG["timeframe"], CFG["history_days"])
-                evolution.evolve(conn, CFG, _load_data(conn))
-                supervisor.supervise(conn, CFG)
-                paper_trade.run_paper(conn, CFG, _load_data(conn))
-            print(f"[OK] Задача '{name}' завершена.")
-    except Exception as e:  # noqa
-        print(f"[ОШИБКА] {type(e).__name__}: {e}")
-    finally:
-        conn.close()
-        with _LOCK:
-            TASK["running"] = False
-            TASK["finished_at"] = time.strftime("%H:%M:%S")
-
-
-@app.route("/api/run/<name>", methods=["POST"])
-def api_run(name):
-    if name not in ("fetch", "evolve", "supervise", "paper", "run"):
-        abort(404)
-    with _LOCK:
-        if TASK["running"]:
-            return jsonify({"ok": False, "error": "Задача уже выполняется"}), 409
-        TASK.update(running=True, name=name, log=[f"▶ Запуск: {name} ..."],
-                    finished_at=None)
-    threading.Thread(target=_run_task, args=(name,), daemon=True).start()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/task")
-def api_task():
-    return jsonify(TASK)
-
-
-@app.route("/api/live/<action>", methods=["POST"])
-def api_live(action):
-    if action == "start":
-        if not LIVE["running"]:
-            LIVE.update(running=True, stop=False, log=["▶ Живая торговля запущена..."])
-            threading.Thread(target=_live_loop, daemon=True).start()
-        return jsonify({"ok": True})
-    if action == "stop":
-        LIVE["stop"] = True
-        return jsonify({"ok": True})
-    abort(404)
-
-
 _NEWS = {"ts": 0, "data": None}
+SYNC = {"ts": 0, "status": "ожидание...", "last_ok": None}
+
+
+# ---------- авто-синхронизация с облаком ----------
+def _sync_loop():
+    while True:
+        try:
+            r = subprocess.run(["git", "pull", "--no-edit"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=90)
+            if r.returncode == 0:
+                SYNC["status"] = "синхронизировано с облаком"
+                SYNC["last_ok"] = time.strftime("%H:%M:%S")
+            else:
+                SYNC["status"] = "нет связи с облаком (показываю последнее)"
+        except Exception:  # noqa
+            SYNC["status"] = "нет интернета (показываю последнее)"
+        SYNC["ts"] = time.time()
+        time.sleep(90)
+
+
+def _macro():
+    if time.time() - _MACRO["ts"] > 300 or _MACRO["data"] is None:
+        try:
+            mc = CFG.get("macro", {})
+            _MACRO["data"] = macro_feed.etf_flow_bias(
+                mc.get("asset", "BTC"), mc.get("lookback_days", 5),
+                mc.get("block_threshold_musd", 0))
+        except Exception as e:  # noqa
+            _MACRO["data"] = {"bias": "neutral", "note": f"ошибка: {e}"}
+        _MACRO["ts"] = time.time()
+    return _MACRO["data"]
 
 
 def _news():
@@ -159,19 +68,6 @@ def _news():
                              "fng": {"value": None, "label": "n/a"}, "news_hits": 0}
         _NEWS["ts"] = time.time()
     return _NEWS["data"]
-
-
-def _macro():
-    if time.time() - _MACRO["ts"] > 300 or _MACRO["data"] is None:
-        mc = CFG.get("macro", {})
-        try:
-            _MACRO["data"] = macro_feed.etf_flow_bias(
-                mc.get("asset", "BTC"), mc.get("lookback_days", 5),
-                mc.get("block_threshold_musd", 0))
-        except Exception as e:  # noqa
-            _MACRO["data"] = {"bias": "neutral", "note": f"ошибка: {e}"}
-        _MACRO["ts"] = time.time()
-    return _MACRO["data"]
 
 
 @app.route("/api/status")
@@ -188,21 +84,15 @@ def api_status():
         g = json.loads(a["genome"])
         out["agents"].append({
             "id": a["id"], "type": g["type"], "symbol": a["symbol"],
-            "status": a["status"],
-            "test_sharpe": a["test_sharpe"], "train_sharpe": a["train_sharpe"],
-            "consistency": a["consistency"], "test_trades": a["test_trades"],
-            "test_return": a["test_return"], "test_maxdd": a["test_maxdd"],
-        })
+            "status": a["status"], "test_sharpe": a["test_sharpe"],
+            "consistency": a["consistency"], "test_trades": a["test_trades"]})
 
-    for d in conn.execute(
-            "SELECT * FROM decisions ORDER BY id DESC LIMIT 20").fetchall():
+    for d in conn.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT 20").fetchall():
         out["decisions"].append({
             "ts": d["ts"][11:19], "agent_id": d["agent_id"],
-            "action": d["action"], "backend": d["backend"],
-            "rationale": d["rationale"]})
+            "action": d["action"], "rationale": d["rationale"]})
 
-    trades = conn.execute(
-        "SELECT * FROM paper_trades ORDER BY id DESC LIMIT 30").fetchall()
+    trades = conn.execute("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 30").fetchall()
     for t in trades:
         out["trades"].append({
             "ts": t["ts"][11:19], "agent_id": t["agent_id"], "symbol": t["symbol"],
@@ -216,32 +106,25 @@ def api_status():
         "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls), 3) if pnls else 0,
         "start_capital": CFG["paper"]["starting_capital"]}
 
-    out["macro"] = _macro()
-    out["news"] = _news()
-
-    # живой счёт
     acc = conn.execute("SELECT * FROM live_account WHERE id=1").fetchone()
     npos = conn.execute("SELECT COUNT(*) c FROM live_positions").fetchone()["c"]
-    out["live"] = {
-        "running": LIVE["running"],
-        "log": LIVE["log"][-12:],
-        "capital": round(acc["capital"], 2) if acc else None,
-        "open_positions": npos,
-        "interval": CFG.get("live", {}).get("interval_seconds", 300),
-    }
+    out["live"] = {"capital": round(acc["capital"], 2) if acc else CFG["paper"]["starting_capital"],
+                   "open_positions": npos}
+
+    out["macro"] = _macro()
+    out["news"] = _news()
+    out["sync"] = {"status": SYNC["status"], "last_ok": SYNC["last_ok"]}
     conn.close()
     return jsonify(out)
 
 
 @app.route("/api/track")
 def api_track():
-    """История автообучения из TRACK_RECORD.csv (по дням)."""
-    import csv as _csv
     rows = []
+    path = os.path.join(ROOT, "TRACK_RECORD.csv")
     try:
-        with open("TRACK_RECORD.csv", encoding="utf-8") as f:
-            for r in _csv.DictReader(f):
-                rows.append(r)
+        with open(path, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
     except FileNotFoundError:
         pass
     return jsonify(rows)
@@ -255,7 +138,7 @@ def index():
 HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Крипто-бот · панель</title>
+<title>Крипто-бот · наблюдение за обучением</title>
 <style>
 :root{--bg:#0b0e14;--panel:#141a24;--panel2:#1b2230;--line:#222c3c;
 --txt:#d7dee8;--mut:#8493a8;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--yel:#eab308;}
@@ -264,7 +147,7 @@ font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:1200px;margin:0 auto;padding:20px}
 h1{font-size:20px;margin:0}h2{font-size:14px;color:var(--mut);text-transform:uppercase;
 letter-spacing:.06em;margin:0 0 10px}
-.top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:18px}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
 .card .v{font-size:22px;font-weight:600;margin-top:4px}
@@ -273,13 +156,6 @@ letter-spacing:.06em;margin:0 0 10px}
 .risk_on{background:rgba(34,197,94,.15);color:var(--grn)}
 .risk_off{background:rgba(239,68,68,.15);color:var(--red)}
 .neutral{background:rgba(132,147,168,.15);color:var(--mut)}
-.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
-button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
-padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500}
-button:hover{border-color:var(--blu)}button:disabled{opacity:.4;cursor:not-allowed}
-button.primary{background:var(--blu);border-color:var(--blu);color:#fff}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-@media(max-width:860px){.grid{grid-template-columns:1fr}}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--mut);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -290,18 +166,18 @@ tr:last-child td{border-bottom:none}
 .t-promote,.t-promoted{background:rgba(34,197,94,.15);color:var(--grn)}
 .t-kill,.t-killed{background:rgba(239,68,68,.15);color:var(--red)}
 .t-hold,.t-candidate{background:rgba(59,130,246,.15);color:var(--blu)}
-.t-generate{background:rgba(234,179,8,.15);color:var(--yel)}
-#log,#livelog{background:#070a0f;border:1px solid var(--line);border-radius:8px;padding:12px;
-height:200px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;color:#9fb3c8;white-space:pre-wrap}
-#livelog{height:150px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mut);margin-right:6px}
-.dot.run{background:var(--yel);animation:p 1s infinite}@keyframes p{50%{opacity:.3}}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:860px){.grid{grid-template-columns:1fr}}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--grn);margin-right:6px}
 .mut{color:var(--mut)}
 </style></head><body><div class="wrap">
 
 <div class="top">
-  <div><h1>🤖 Крипто-бот · панель управления</h1>
-  <div class="mut" id="sub">Инфраструктура — Python · Управление — супервизор</div></div>
+  <div>
+    <h1>🤖 Крипто-бот · наблюдение за обучением</h1>
+    <div class="mut">Обучение идёт само в облаке. Эта панель только показывает прогресс.</div>
+    <div class="mut" id="sync" style="margin-top:4px"><span class="dot"></span>—</div>
+  </div>
   <div style="text-align:right">
     <div id="macro"><span class="badge neutral">макро…</span></div>
     <div id="news" style="margin-top:6px"><span class="badge neutral">новости…</span></div>
@@ -311,45 +187,22 @@ height:200px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;color:#
 <div class="cards" id="cards"></div>
 
 <div class="panel">
-  <h2>Управление</h2>
-  <div class="bar">
-    <button onclick="run('fetch')" id="b-fetch">1 · Загрузить данные</button>
-    <button onclick="run('evolve')" id="b-evolve">2 · Эволюция</button>
-    <button onclick="run('supervise')" id="b-supervise">3 · Супервизор</button>
-    <button onclick="run('paper')" id="b-paper">4 · Бумага</button>
-    <button onclick="run('run')" id="b-run" class="primary">▶ Всё подряд</button>
-    <span class="mut" id="taskstate" style="align-self:center"><span class="dot"></span>простаивает</span>
-  </div>
-  <div id="log"></div>
-</div>
-
-<div class="panel">
-  <h2>Прогресс обучения (по дням, из облака)</h2>
+  <h2>Прогресс обучения (из облака, обновляется само)</h2>
   <div id="trackchart" style="margin-bottom:12px"></div>
-  <div style="max-height:220px;overflow:auto">
-    <table><thead><tr><th>дата</th><th>капитал</th><th>кандидатов</th>
-    <th>в live</th><th>лучший Sharpe</th><th>рынок</th></tr></thead>
+  <div style="max-height:260px;overflow:auto">
+    <table><thead><tr><th>время (UTC)</th><th>капитал</th><th>кандидатов</th>
+    <th>в live</th><th>лучший Sharpe</th><th>рынок</th><th>F&amp;G</th></tr></thead>
     <tbody id="track"></tbody></table>
   </div>
 </div>
 
-<div class="panel">
-  <h2>Живая торговля (реальное время · без реальных денег)</h2>
-  <div class="bar">
-    <button onclick="live('start')" id="b-live-start" class="primary">▶ Запустить живую торговлю</button>
-    <button onclick="live('stop')" id="b-live-stop">⏹ Остановить</button>
-    <span class="mut" id="livestate" style="align-self:center"><span class="dot"></span>выключена</span>
-  </div>
-  <div id="livelog"></div>
-</div>
-
 <div class="grid">
-  <div class="panel"><h2>Агенты (топ по out-of-sample Sharpe)</h2>
+  <div class="panel"><h2>Живые агенты (топ по OOS Sharpe)</h2>
     <table><thead><tr><th>#</th><th>тип</th><th>символ</th><th>статус</th>
-    <th>test Sharpe</th><th>cons.</th><th>сделок</th></tr></thead>
+    <th>Sharpe</th><th>устойч.</th><th>сделок</th></tr></thead>
     <tbody id="agents"></tbody></table></div>
 
-  <div class="panel"><h2>Решения супервизора</h2>
+  <div class="panel"><h2>Решения эволюции</h2>
     <table><thead><tr><th>время</th><th>агент</th><th>действие</th><th>почему</th></tr></thead>
     <tbody id="decisions"></tbody></table></div>
 </div>
@@ -361,68 +214,71 @@ height:200px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;color:#
 
 <script>
 const $=s=>document.querySelector(s);
-function num(x,d=2){return x==null?'—':(+x).toFixed(d)}
+function num(x,d=2){return x==null||x===''?'—':(+x).toFixed(d)}
 function cls(x){return x>0?'pos':(x<0?'neg':'')}
 
-async function run(name){
-  const r=await fetch('/api/run/'+name,{method:'POST'});
-  if(r.status===409){alert('Задача уже выполняется');return}
-  poll();
+function lineChart(vals,w,h){
+  const pts=vals.map((v,i)=>[i,v]).filter(p=>p[1]!=null&&!isNaN(p[1]));
+  if(pts.length<2) return '<div class="mut">Пока мало данных для графика (нужно 2+ точки).</div>';
+  const ys=pts.map(p=>p[1]); let mn=Math.min(...ys,0),mx=Math.max(...ys,0);
+  if(mn===mx){mn-=1;mx+=1;}
+  const pad=24,W=w,H=h;
+  const xf=i=>pad+(i/(vals.length-1))*(W-2*pad);
+  const yf=v=>H-pad-((v-mn)/(mx-mn))*(H-2*pad);
+  const poly=pts.map(p=>`${xf(p[0]).toFixed(1)},${yf(p[1]).toFixed(1)}`).join(' ');
+  const z=yf(0);
+  return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="background:#070a0f;border:1px solid var(--line);border-radius:8px">
+    <line x1="${pad}" y1="${z}" x2="${W-pad}" y2="${z}" stroke="#33415580" stroke-dasharray="4"/>
+    <text x="4" y="${z-3}" fill="#64748b" font-size="10">0</text>
+    <text x="4" y="14" fill="#64748b" font-size="10">${mx.toFixed(1)}</text>
+    <text x="4" y="${H-6}" fill="#64748b" font-size="10">${mn.toFixed(1)}</text>
+    <polyline fill="none" stroke="#3b82f6" stroke-width="2" points="${poly}"/></svg>`;
 }
-function setButtons(dis){['fetch','evolve','supervise','paper','run'].forEach(n=>$('#b-'+n).disabled=dis)}
 
-async function live(action){
-  const r=await fetch('/api/live/'+action,{method:'POST'});
-  setTimeout(refresh,300);
-}
-
-async function poll(){
-  const t=await (await fetch('/api/task')).json();
-  $('#log').textContent=(t.log||[]).join('\n');$('#log').scrollTop=1e9;
-  setButtons(t.running);
-  $('#taskstate').innerHTML=t.running
-    ?'<span class="dot run"></span>выполняется: '+t.name
-    :'<span class="dot"></span>простаивает'+(t.finished_at?' · готово '+t.finished_at:'');
-  if(t.running)setTimeout(poll,1200);
+async function renderTrack(){
+  let d=[]; try{ d=await (await fetch('/api/track')).json(); }catch(e){ return; }
+  const sh=d.map(r=>r.best_test_sharpe===''?null:parseFloat(r.best_test_sharpe));
+  $('#trackchart').innerHTML='<div class="mut" style="margin-bottom:4px">Лучший Sharpe во времени (растёт к 0 и выше = бот находит преимущество)</div>'+lineChart(sh,640,150);
+  $('#track').innerHTML=d.slice().reverse().slice(0,120).map(r=>`<tr>
+    <td class="mut">${r.date}</td><td>${num(r.capital,0)}</td>
+    <td>${r.candidates}</td><td>${r.promoted}</td>
+    <td class="${(parseFloat(r.best_test_sharpe)||0)>0?'pos':'neg'}">${r.best_test_sharpe||'—'}</td>
+    <td class="mut">${r.macro_bias||''}</td><td class="mut">${r.fear_greed||''}</td></tr>`).join('')
+    ||'<tr><td colspan=7 class="mut">журнал пуст — облако ещё не присылало данные</td></tr>';
 }
 
 async function refresh(){
-  const d=await (await fetch('/api/status')).json();
-  const m=d.macro||{};
+  let d; try{ d=await (await fetch('/api/status')).json(); }catch(e){ return; }
+  const m=d.macro||{},nw=d.news||{},fng=(nw.fng||{}),sy=d.sync||{};
+  $('#sync').innerHTML='<span class="dot"></span>'+(sy.status||'—')+(sy.last_ok?(' · последняя синхронизация '+sy.last_ok):'');
   $('#macro').innerHTML='<span class="badge '+(m.bias||'neutral')+'">ETF: '+(m.bias||'—')+
     '</span> <span class="mut">'+(m.note||'')+'</span>';
-  const nw=d.news||{}; const fng=(nw.fng||{});
   const ncls=nw.block?'risk_off':'risk_on';
   $('#news').innerHTML='<span class="badge '+ncls+'">Новости: '+(nw.block?'входы стоп':'спокойно')+
-    '</span> <span class="mut">F&amp;G '+(fng.value??'—')+' '+(fng.label||'')+
-    (nw.news_hits?(' · негатив:'+nw.news_hits):'')+'</span>';
-  const cap=d.paper.start_capital, pnl=d.paper.realized_pnl;
+    '</span> <span class="mut">F&amp;G '+(fng.value??'—')+' '+(fng.label||'')+'</span>';
+
+  const cap=d.live.capital,start=d.paper.start_capital,ret=cap/start-1;
   $('#cards').innerHTML=`
+   <div class="card"><div class="l">Капитал (бумага)</div><div class="v ${cls(ret)}">${num(cap,0)}</div></div>
+   <div class="card"><div class="l">Доходность</div><div class="v ${cls(ret)}">${(ret*100).toFixed(2)}%</div></div>
    <div class="card"><div class="l">Кандидаты</div><div class="v">${d.counts.candidate}</div></div>
    <div class="card"><div class="l">Продвинуто (live)</div><div class="v" style="color:var(--grn)">${d.counts.promoted}</div></div>
-   <div class="card"><div class="l">Убито</div><div class="v" style="color:var(--red)">${d.counts.killed}</div></div>
-   <div class="card"><div class="l">Бумажный PnL</div><div class="v ${cls(pnl)}">${pnl>0?'+':''}${num(pnl)}</div></div>
-   <div class="card"><div class="l">Сделок / Win rate</div><div class="v">${d.paper.closed_trades} · ${(d.paper.win_rate*100).toFixed(0)}%</div></div>`;
+   <div class="card"><div class="l">Убито всего</div><div class="v" style="color:var(--red)">${d.counts.killed}</div></div>
+   <div class="card"><div class="l">Открытых позиций</div><div class="v">${d.live.open_positions}</div></div>`;
 
   $('#agents').innerHTML=d.agents.map(a=>`<tr>
     <td>${a.id}</td><td>${a.type}</td><td>${a.symbol}</td>
     <td><span class="tag t-${a.status}">${a.status}</span></td>
     <td class="${cls(a.test_sharpe)}">${num(a.test_sharpe)}</td>
-    <td>${num(a.consistency)}</td><td>${a.test_trades??'—'}</td></tr>`).join('')
-    ||'<tr><td colspan=7 class="mut">пусто — запусти Эволюцию</td></tr>';
+    <td>${a.consistency==null?'—':Math.round(a.consistency*100)+'%'}</td>
+    <td>${a.test_trades??'—'}</td></tr>`).join('')
+    ||'<tr><td colspan=7 class="mut">пока нет живых агентов</td></tr>';
 
   $('#decisions').innerHTML=d.decisions.map(x=>`<tr>
     <td class="mut">${x.ts}</td><td>#${x.agent_id??''}</td>
     <td><span class="tag t-${x.action}">${x.action}</span></td>
     <td class="mut">${x.rationale}</td></tr>`).join('')
     ||'<tr><td colspan=4 class="mut">пока нет решений</td></tr>';
-
-  const lv=d.live||{};
-  $('#livelog').textContent=(lv.log||[]).join('\n');$('#livelog').scrollTop=1e9;
-  $('#livestate').innerHTML=lv.running
-    ?'<span class="dot run"></span>работает · проверка каждые '+Math.round((lv.interval||300)/60)+' мин · позиций '+lv.open_positions
-    :'<span class="dot"></span>выключена';
-  $('#b-live-start').disabled=lv.running;$('#b-live-stop').disabled=!lv.running;
 
   $('#trades').innerHTML=d.trades.map(t=>`<tr>
     <td class="mut">${t.ts}</td><td>#${t.agent_id}</td><td>${t.symbol}</td>
@@ -432,46 +288,12 @@ async function refresh(){
     ||'<tr><td colspan=7 class="mut">сделок пока нет</td></tr>';
 }
 
-function lineChart(vals, w, h){
-  // vals: массив чисел (может содержать null). Рисует линию + нулевую ось.
-  const pts=vals.map((v,i)=>[i,v]).filter(p=>p[1]!=null && !isNaN(p[1]));
-  if(pts.length<2) return '<div class="mut">Пока мало данных для графика (нужно 2+ дня).</div>';
-  const ys=pts.map(p=>p[1]); let mn=Math.min(...ys,0), mx=Math.max(...ys,0);
-  if(mn===mx){mn-=1;mx+=1;}
-  const pad=24, W=w, H=h;
-  const xf=i=>pad+(i/(vals.length-1))*(W-2*pad);
-  const yf=v=>H-pad-((v-mn)/(mx-mn))*(H-2*pad);
-  const poly=pts.map(p=>`${xf(p[0]).toFixed(1)},${yf(p[1]).toFixed(1)}`).join(' ');
-  const zeroY=yf(0);
-  return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="background:#070a0f;border:1px solid var(--line);border-radius:8px">
-    <line x1="${pad}" y1="${zeroY}" x2="${W-pad}" y2="${zeroY}" stroke="#33415580" stroke-dasharray="4"/>
-    <text x="4" y="${zeroY-3}" fill="#64748b" font-size="10">0</text>
-    <text x="4" y="14" fill="#64748b" font-size="10">${mx.toFixed(1)}</text>
-    <text x="4" y="${H-6}" fill="#64748b" font-size="10">${mn.toFixed(1)}</text>
-    <polyline fill="none" stroke="#3b82f6" stroke-width="2" points="${poly}"/>
-  </svg>`;
-}
-
-async function renderTrack(){
-  let d=[];
-  try{ d=await (await fetch('/api/track')).json(); }catch(e){ return; }
-  // на день берём последнюю запись (если их несколько)
-  const byDay={}; d.forEach(r=>byDay[r.date]=r);
-  const rows=Object.values(byDay);
-  const sharpe=rows.map(r=>r.best_test_sharpe===''?null:parseFloat(r.best_test_sharpe));
-  $('#trackchart').innerHTML='<div class="mut" style="margin-bottom:4px">Лучший Sharpe по дням (растёт к 0 и выше = бот находит преимущество)</div>'+lineChart(sharpe,640,150);
-  $('#track').innerHTML=rows.slice().reverse().map(r=>`<tr>
-    <td class="mut">${r.date}</td><td>${(+r.capital).toFixed(0)}</td>
-    <td>${r.candidates}</td><td>${r.promoted}</td>
-    <td class="${(parseFloat(r.best_test_sharpe)||0)>0?'pos':'neg'}">${r.best_test_sharpe||'—'}</td>
-    <td class="mut">${r.macro_bias}</td></tr>`).join('')
-    ||'<tr><td colspan=6 class="mut">журнал пуст — облако ещё не запускалось</td></tr>';
-}
-
-refresh();renderTrack();setInterval(()=>{refresh();renderTrack();},3000);poll();
+refresh();renderTrack();
+setInterval(()=>{refresh();renderTrack();},5000);
 </script></div></body></html>
 """
 
 if __name__ == "__main__":
-    print("Дашборд: http://127.0.0.1:5000  (Ctrl+C для остановки)")
+    threading.Thread(target=_sync_loop, daemon=True).start()
+    print("Панель-наблюдатель: http://127.0.0.1:5000  (Ctrl+C для остановки)")
     app.run(host="127.0.0.1", port=5000, debug=False)

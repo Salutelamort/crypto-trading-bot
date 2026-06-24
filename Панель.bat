@@ -1,14 +1,14 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo Подтягиваю свежее обучение из облака...
+echo Updating from cloud...
 git pull --no-edit 2>nul
-echo Запускаю панель управления ботом...
-start "Торговый бот" /min python dashboard.py
-timeout /t 3 /nobreak >nul
+echo Starting bot server in a new window...
+start "Bot server - KEEP THIS OPEN" cmd /k python dashboard.py
+timeout /t 6 >nul
 start "" http://127.0.0.1:5000
 echo.
-echo Панель открыта в браузере: http://127.0.0.1:5000
-echo Это окно можно свернуть. Чтобы выключить бота - закрой это окно.
-echo.
-pause
+echo Panel opened: http://127.0.0.1:5000
+echo Keep the "Bot server" window open. Close it to stop the bot.
+echo This window will close in 6 seconds.
+timeout /t 6 >nul

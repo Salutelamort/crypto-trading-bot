@@ -1,18 +1,19 @@
 """
-ЕЖЕДНЕВНОЕ АВТООБУЧЕНИЕ (запускается роботом GitHub Actions, без участия человека).
+АВТООБУЧЕНИЕ (запускается роботом GitHub Actions каждые 15 минут, без человека).
 
-Раз в день:
-  1. качает свежие цены;
-  2. эволюционирует и отбирает стратегии (супервизор);
-  3. делает один "тик" живой бумажной торговли;
-  4. дописывает строку в журнал TRACK_RECORD.csv — честная история на реальном рынке.
+За один прогон — "пачка" циклов в пределах бюджета времени:
+  1. качает свежие цены (один раз);
+  2. эволюционирует стратегии (рождение/смерть агентов) — несколько циклов подряд;
+  3. отбор + тик живой бумажной торговли;
+  4. дописывает строку с временной меткой в журнал TRACK_RECORD.csv.
 
-За ~90 запусков (3 месяца) накапливается forward-track-record на ранее невиданных
-данных. По нему ЧЕЛОВЕК потом решает, допускать ли стратегию к реальным деньгам.
-Автоматического перехода на реальные деньги НЕТ — это сознательная мера безопасности.
+Популяция сохраняется в БД между прогонами, поэтому эволюция продолжается
+непрерывно. За 3 месяца накапливается forward-track-record на невиданных данных.
+По нему ЧЕЛОВЕК потом решает про реальные деньги. Автоперехода НЕТ — мера безопасности.
 """
 import os
 import csv
+import time
 import datetime
 import yaml
 
@@ -25,25 +26,11 @@ HEADER = ["date", "equity", "capital", "open_positions",
           "fear_greed", "news_hits"]
 
 
-def main():
-    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
-    conn = db.connect(cfg["db_path"])
-
-    print("== Ежедневное автообучение ==")
-    # 1. свежие данные
-    for sym in cfg["symbols"]:
-        feed.fetch_ohlcv(conn, sym, cfg["timeframe"], cfg["history_days"])
-    data = {s: feed.load_ohlcv(conn, s, cfg["timeframe"]) for s in cfg["symbols"]}
-    data = {s: d for s, d in data.items() if not d.empty}
-
-    # 2. эволюция + отбор
-    evolution.evolve(conn, cfg, data)
+def _record_row(conn, cfg):
+    """Один цикл: отбор + тик + запись строки в журнал (с временной меткой)."""
     supervisor.supervise(conn, cfg)
-
-    # 3. тик живой бумажной торговли
     live_trade.tick(conn, cfg)
 
-    # 4. запись в журнал
     capital, equity, npos = live_trade.account_equity(conn, cfg)
     cand = len(db.get_agents(conn, "candidate"))
     prom = len(db.get_agents(conn, "promoted"))
@@ -56,14 +43,13 @@ def main():
         bias = "n/a"
     try:
         ng = news_feed.news_gate(cfg)
-        fng = ng["fng"]["value"]
-        nhits = ng["news_hits"]
+        fng, nhits = ng["fng"]["value"], ng["news_hits"]
     except Exception:  # noqa
         fng, nhits = "", ""
 
-    row = [datetime.date.today().isoformat(), round(equity, 2), round(capital, 2),
-           npos, cand, prom, round(row_best, 3) if row_best is not None else "",
-           bias, fng, nhits]
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+    row = [ts, round(equity, 2), round(capital, 2), npos, cand, prom,
+           round(row_best, 3) if row_best is not None else "", bias, fng, nhits]
 
     new_file = not os.path.exists(CSV_PATH)
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
@@ -71,11 +57,35 @@ def main():
         if new_file:
             w.writerow(HEADER)
         w.writerow(row)
+    print(f"[{ts}] капитал {equity:,.2f} | кандидатов {cand} | "
+          f"продвинуто {prom} | лучший Sharpe {row_best if row_best is not None else '—'}")
 
-    print(f"\nЗаписано в {CSV_PATH}: {dict(zip(HEADER, row))}")
-    start = cfg["paper"]["starting_capital"]
-    print(f"Итог дня: капитал {equity:,.2f} ({equity/start-1:+.2%}), "
-          f"продвинуто {prom}, кандидатов {cand}")
+
+def main():
+    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    conn = db.connect(cfg["db_path"])
+
+    # бюджет времени на один облачный прогон (минут). Репо публичный → минуты
+    # бесплатны, поэтому за один слот делаем несколько циклов эволюции "пачкой".
+    budget_min = float(os.environ.get("LEARN_BUDGET_MIN", "8"))
+    deadline = time.time() + budget_min * 60
+
+    print(f"== Автообучение (пачка, бюджет {budget_min} мин) ==")
+    # данные тянем один раз в начале прогона
+    for sym in cfg["symbols"]:
+        feed.fetch_ohlcv(conn, sym, cfg["timeframe"], cfg["history_days"])
+    data = {s: feed.load_ohlcv(conn, s, cfg["timeframe"]) for s in cfg["symbols"]}
+    data = {s: d for s, d in data.items() if not d.empty}
+
+    cycles = 0
+    while True:
+        evolution.evolve(conn, cfg, data)   # рождение/смерть агентов
+        _record_row(conn, cfg)              # отбор + тик + журнал
+        cycles += 1
+        if time.time() >= deadline:
+            break
+
+    print(f"\nГотово: циклов эволюции за прогон — {cycles}")
     conn.close()
 
 
