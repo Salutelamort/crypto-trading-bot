@@ -1,2 +1,3 @@
 date,equity,capital,open_positions,candidates,promoted,best_test_sharpe,macro_bias
 2026-06-24,10000.0,10000.0,0,0,0,,risk_off
+2026-06-24,10000.0,10000.0,0,1,0,-5.193,neutral
