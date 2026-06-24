@@ -26,7 +26,10 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict) -> dict:
     fee = costs["fee_pct"]
     slip = costs["slippage_pct"]
 
-    sig = gn.signal(genome, df)
+    # Задержка исполнения: реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не мгновенно).
+    # Это убирает зависимость стратегии от скорости доступа к бирже.
+    delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+    sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
     close = df["close"].values
     high = df["high"].values
     low = df["low"].values

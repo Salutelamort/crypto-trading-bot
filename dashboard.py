@@ -218,6 +218,20 @@ def api_status():
     return jsonify(out)
 
 
+@app.route("/api/track")
+def api_track():
+    """История автообучения из TRACK_RECORD.csv (по дням)."""
+    import csv as _csv
+    rows = []
+    try:
+        with open("TRACK_RECORD.csv", encoding="utf-8") as f:
+            for r in _csv.DictReader(f):
+                rows.append(r)
+    except FileNotFoundError:
+        pass
+    return jsonify(rows)
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -289,6 +303,16 @@ height:200px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;color:#
     <span class="mut" id="taskstate" style="align-self:center"><span class="dot"></span>простаивает</span>
   </div>
   <div id="log"></div>
+</div>
+
+<div class="panel">
+  <h2>Прогресс обучения (по дням, из облака)</h2>
+  <div id="trackchart" style="margin-bottom:12px"></div>
+  <div style="max-height:220px;overflow:auto">
+    <table><thead><tr><th>дата</th><th>капитал</th><th>кандидатов</th>
+    <th>в live</th><th>лучший Sharpe</th><th>рынок</th></tr></thead>
+    <tbody id="track"></tbody></table>
+  </div>
 </div>
 
 <div class="panel">
@@ -385,7 +409,43 @@ async function refresh(){
     ||'<tr><td colspan=7 class="mut">сделок пока нет</td></tr>';
 }
 
-refresh();setInterval(refresh,3000);poll();
+function lineChart(vals, w, h){
+  // vals: массив чисел (может содержать null). Рисует линию + нулевую ось.
+  const pts=vals.map((v,i)=>[i,v]).filter(p=>p[1]!=null && !isNaN(p[1]));
+  if(pts.length<2) return '<div class="mut">Пока мало данных для графика (нужно 2+ дня).</div>';
+  const ys=pts.map(p=>p[1]); let mn=Math.min(...ys,0), mx=Math.max(...ys,0);
+  if(mn===mx){mn-=1;mx+=1;}
+  const pad=24, W=w, H=h;
+  const xf=i=>pad+(i/(vals.length-1))*(W-2*pad);
+  const yf=v=>H-pad-((v-mn)/(mx-mn))*(H-2*pad);
+  const poly=pts.map(p=>`${xf(p[0]).toFixed(1)},${yf(p[1]).toFixed(1)}`).join(' ');
+  const zeroY=yf(0);
+  return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="background:#070a0f;border:1px solid var(--line);border-radius:8px">
+    <line x1="${pad}" y1="${zeroY}" x2="${W-pad}" y2="${zeroY}" stroke="#33415580" stroke-dasharray="4"/>
+    <text x="4" y="${zeroY-3}" fill="#64748b" font-size="10">0</text>
+    <text x="4" y="14" fill="#64748b" font-size="10">${mx.toFixed(1)}</text>
+    <text x="4" y="${H-6}" fill="#64748b" font-size="10">${mn.toFixed(1)}</text>
+    <polyline fill="none" stroke="#3b82f6" stroke-width="2" points="${poly}"/>
+  </svg>`;
+}
+
+async function renderTrack(){
+  let d=[];
+  try{ d=await (await fetch('/api/track')).json(); }catch(e){ return; }
+  // на день берём последнюю запись (если их несколько)
+  const byDay={}; d.forEach(r=>byDay[r.date]=r);
+  const rows=Object.values(byDay);
+  const sharpe=rows.map(r=>r.best_test_sharpe===''?null:parseFloat(r.best_test_sharpe));
+  $('#trackchart').innerHTML='<div class="mut" style="margin-bottom:4px">Лучший Sharpe по дням (растёт к 0 и выше = бот находит преимущество)</div>'+lineChart(sharpe,640,150);
+  $('#track').innerHTML=rows.slice().reverse().map(r=>`<tr>
+    <td class="mut">${r.date}</td><td>${(+r.capital).toFixed(0)}</td>
+    <td>${r.candidates}</td><td>${r.promoted}</td>
+    <td class="${(parseFloat(r.best_test_sharpe)||0)>0?'pos':'neg'}">${r.best_test_sharpe||'—'}</td>
+    <td class="mut">${r.macro_bias}</td></tr>`).join('')
+    ||'<tr><td colspan=6 class="mut">журнал пуст — облако ещё не запускалось</td></tr>';
+}
+
+refresh();renderTrack();setInterval(()=>{refresh();renderTrack();},3000);poll();
 </script></div></body></html>
 """
 

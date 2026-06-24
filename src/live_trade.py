@@ -140,7 +140,10 @@ def tick(conn, cfg, verbose=True):
         df = data[sym]
         price = float(df["close"].iloc[-1])
         g = json.loads(a["genome"])
-        sig = int(gn.signal(g, df).iloc[-1])
+        # реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не на текущий, формирующийся) —
+        # не зависим от скорости доступа к бирже.
+        delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+        sig = int(gn.signal(g, df).shift(delay).fillna(0).iloc[-1])
         pos = positions.get(aid)
 
         # 1. управление позицией

@@ -56,7 +56,8 @@ def run_paper(conn, cfg, data_by_symbol):
             continue
         _, test_df = bt.split_train_test(data_by_symbol[sym], cfg["train_ratio"])
         g = json.loads(a["genome"])
-        sig = gn.signal(g, test_df)
+        delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+        sig = gn.signal(g, test_df).shift(delay).fillna(0).astype(int)
         streams.append({"agent": a, "df": test_df, "sig": sig, "g": g})
 
     if not streams:
