@@ -17,11 +17,12 @@ import datetime
 import yaml
 
 from src import db, data_feed as feed
-from src import evolution, supervisor, live_trade, macro_feed
+from src import evolution, supervisor, live_trade, macro_feed, news_feed
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",
-          "candidates", "promoted", "best_test_sharpe", "macro_bias"]
+          "candidates", "promoted", "best_test_sharpe", "macro_bias",
+          "fear_greed", "news_hits"]
 
 
 def main():
@@ -53,10 +54,16 @@ def main():
         bias = macro_feed.etf_flow_bias(cfg.get("macro", {}).get("asset", "BTC"))["bias"]
     except Exception:  # noqa
         bias = "n/a"
+    try:
+        ng = news_feed.news_gate(cfg)
+        fng = ng["fng"]["value"]
+        nhits = ng["news_hits"]
+    except Exception:  # noqa
+        fng, nhits = "", ""
 
     row = [datetime.date.today().isoformat(), round(equity, 2), round(capital, 2),
            npos, cand, prom, round(row_best, 3) if row_best is not None else "",
-           bias]
+           bias, fng, nhits]
 
     new_file = not os.path.exists(CSV_PATH)
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:

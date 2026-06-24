@@ -19,7 +19,7 @@
 import time
 import json
 
-from . import db, data_feed as feed, genome as gn, risk as rk, macro_feed
+from . import db, data_feed as feed, genome as gn, risk as rk, macro_feed, news_feed
 from .db import now_iso
 
 
@@ -105,6 +105,17 @@ def tick(conn, cfg, verbose=True):
         except Exception:  # noqa
             pass
 
+    # новостной страж (индекс страха/жадности + негативные катализаторы)
+    news_block = False
+    news_reason = ""
+    if cfg.get("news", {}).get("enabled"):
+        try:
+            ng = news_feed.news_gate(cfg)
+            news_block = ng["block"]
+            news_reason = ng["reason"]
+        except Exception:  # noqa
+            pass
+
     positions = _load_positions(conn)
 
     # свежие данные по уникальным символам
@@ -165,7 +176,7 @@ def tick(conn, cfg, verbose=True):
                 _save_position(conn, pos)  # сохранить обновлённый peak_price
 
         # 2. вход по сигналу
-        elif sig == 1 and not macro_block and not dd_halt \
+        elif sig == 1 and not macro_block and not news_block and not dd_halt \
                 and rk.can_open(len(positions), risk_cfg):
             invest = rk.position_size(capital, risk_cfg)
             if 0 < invest <= capital:
@@ -189,6 +200,8 @@ def tick(conn, cfg, verbose=True):
             flags.append("ДЕМО: агенты НЕ прошли отбор")
         if macro_block:
             flags.append("макро risk_off — входы стоп")
+        if news_block:
+            flags.append(f"новости: {news_reason} — входы стоп")
         if dd_halt:
             flags.append(f"стоп-кран просадки {dd:.1%}")
         tag = "  [" + "; ".join(flags) + "]" if flags else ""

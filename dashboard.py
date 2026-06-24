@@ -24,7 +24,7 @@ from flask import Flask, jsonify, render_template_string, abort
 
 from src import db
 from src import data_feed as feed
-from src import evolution, supervisor, paper_trade, macro_feed, live_trade
+from src import evolution, supervisor, paper_trade, macro_feed, live_trade, news_feed
 
 app = Flask(__name__)
 CFG = yaml.safe_load(open("config.yaml", encoding="utf-8"))
@@ -147,6 +147,20 @@ def api_live(action):
     abort(404)
 
 
+_NEWS = {"ts": 0, "data": None}
+
+
+def _news():
+    if time.time() - _NEWS["ts"] > 300 or _NEWS["data"] is None:
+        try:
+            _NEWS["data"] = news_feed.news_gate(CFG)
+        except Exception as e:  # noqa
+            _NEWS["data"] = {"block": False, "reason": f"ошибка: {e}",
+                             "fng": {"value": None, "label": "n/a"}, "news_hits": 0}
+        _NEWS["ts"] = time.time()
+    return _NEWS["data"]
+
+
 def _macro():
     if time.time() - _MACRO["ts"] > 300 or _MACRO["data"] is None:
         mc = CFG.get("macro", {})
@@ -203,6 +217,7 @@ def api_status():
         "start_capital": CFG["paper"]["starting_capital"]}
 
     out["macro"] = _macro()
+    out["news"] = _news()
 
     # живой счёт
     acc = conn.execute("SELECT * FROM live_account WHERE id=1").fetchone()
@@ -287,7 +302,10 @@ height:200px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;color:#
 <div class="top">
   <div><h1>🤖 Крипто-бот · панель управления</h1>
   <div class="mut" id="sub">Инфраструктура — Python · Управление — супервизор</div></div>
-  <div id="macro"><span class="badge neutral">макро…</span></div>
+  <div style="text-align:right">
+    <div id="macro"><span class="badge neutral">макро…</span></div>
+    <div id="news" style="margin-top:6px"><span class="badge neutral">новости…</span></div>
+  </div>
 </div>
 
 <div class="cards" id="cards"></div>
@@ -373,6 +391,11 @@ async function refresh(){
   const m=d.macro||{};
   $('#macro').innerHTML='<span class="badge '+(m.bias||'neutral')+'">ETF: '+(m.bias||'—')+
     '</span> <span class="mut">'+(m.note||'')+'</span>';
+  const nw=d.news||{}; const fng=(nw.fng||{});
+  const ncls=nw.block?'risk_off':'risk_on';
+  $('#news').innerHTML='<span class="badge '+ncls+'">Новости: '+(nw.block?'входы стоп':'спокойно')+
+    '</span> <span class="mut">F&amp;G '+(fng.value??'—')+' '+(fng.label||'')+
+    (nw.news_hits?(' · негатив:'+nw.news_hits):'')+'</span>';
   const cap=d.paper.start_capital, pnl=d.paper.realized_pnl;
   $('#cards').innerHTML=`
    <div class="card"><div class="l">Кандидаты</div><div class="v">${d.counts.candidate}</div></div>
