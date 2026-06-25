@@ -192,6 +192,8 @@ def tick(conn, cfg, verbose=True):
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
         sig = int(gn.signal(g, df, allow_short).shift(delay).fillna(0).iloc[-1])
         pos = positions.get(aid)
+        # сколько позиций уже открыто по этой монете (анти-концентрация на исполнении)
+        sym_count = sum(1 for p in positions.values() if p.symbol == sym)
 
         # 1. управление позицией — внутрибарно по 1m свечам (стоп как реальный ордер)
         if pos is not None:
@@ -215,6 +217,7 @@ def tick(conn, cfg, verbose=True):
         # 2. вход по сигналу (long или short)
         elif sig != 0 and not macro_block and not news_block and not dd_halt \
                 and not guard_block and sym not in locked \
+                and sym_count < risk_cfg.get("max_positions_per_symbol", 99) \
                 and rk.can_open(len(positions), risk_cfg):
             invest = rk.position_size(capital, risk_cfg)
             if 0 < invest <= capital:

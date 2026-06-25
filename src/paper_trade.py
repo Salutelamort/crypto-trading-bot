@@ -131,8 +131,10 @@ def run_paper(conn, cfg, data_by_key):
                 cooldown_left[aid] -= 1   # «отдыхаем» после выхода
 
             # 2. Вход (long или short): лимит, макро-страж, стоп-кран И кулдаун.
+            sym_count = sum(1 for p in open_positions.values() if p.symbol == a["symbol"])
             if aid not in open_positions and (not macro_block) and (not dd_halt) \
                     and sig_now != 0 and cooldown_left.get(aid, 0) <= 0 \
+                    and sym_count < risk_cfg.get("max_positions_per_symbol", 99) \
                     and rk.can_open(len(open_positions), risk_cfg):
                 invest = rk.position_size(capital, risk_cfg)
                 if invest <= 0 or invest > capital:
