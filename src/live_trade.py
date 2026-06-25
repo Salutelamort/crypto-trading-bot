@@ -21,6 +21,7 @@ import json
 
 from . import db, data_feed as feed, genome as gn, risk as rk, macro_feed, news_feed
 from . import indicators as ind
+from . import protections
 from .db import now_iso
 
 
@@ -123,6 +124,15 @@ def tick(conn, cfg, verbose=True):
         except Exception:  # noqa
             pass
 
+    # ЗАЩИТЫ (Freqtrade-стиль): пауза после серии убытков + блок плохих символов
+    guard_block, guard_reason = False, ""
+    locked = set()
+    try:
+        guard_block, guard_reason = protections.stoploss_guard(conn, cfg)
+        locked = protections.locked_symbols(conn, cfg)
+    except Exception:  # noqa
+        pass
+
     positions = _load_positions(conn)
     interval = cfg.get("live", {}).get("interval_seconds", 300)
     n_min = max(2, int(interval / 60) + 1)  # сколько 1m-баров покрывают паузу между тиками
@@ -204,6 +214,7 @@ def tick(conn, cfg, verbose=True):
 
         # 2. вход по сигналу (long или short)
         elif sig != 0 and not macro_block and not news_block and not dd_halt \
+                and not guard_block and sym not in locked \
                 and rk.can_open(len(positions), risk_cfg):
             invest = rk.position_size(capital, risk_cfg)
             if 0 < invest <= capital:
@@ -238,6 +249,10 @@ def tick(conn, cfg, verbose=True):
             flags.append(f"новости: {news_reason} — входы стоп")
         if dd_halt:
             flags.append(f"стоп-кран просадки {dd:.1%}")
+        if guard_block:
+            flags.append(guard_reason)
+        if locked:
+            flags.append(f"заблокированы символы: {', '.join(sorted(locked))}")
         tag = "  [" + "; ".join(flags) + "]" if flags else ""
         ret = eq / float(cfg["paper"]["starting_capital"]) - 1
         print(f"[{stamp}] капитал {eq:,.2f} ({ret:+.2%}) | "
