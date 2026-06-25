@@ -136,13 +136,17 @@ def run_paper(conn, cfg, data_by_key):
                     and sig_now != 0 and cooldown_left.get(aid, 0) <= 0 \
                     and sym_count < risk_cfg.get("max_positions_per_symbol", 99) \
                     and rk.can_open(len(open_positions), risk_cfg):
-                invest = rk.position_size(capital, risk_cfg)
+                g = s["g"]
+                atr_val = float(s["atr"].loc[ts]) if s["atr"] is not None and ts in s["atr"].index else None
+                # волатильность-таргетинг: размер от риска до стопа (стоп — ген агента)
+                eff_risk = dict(risk_cfg)
+                if g.get("stop_atr"):
+                    eff_risk["atr_stop_mult"] = g["stop_atr"]
+                invest = rk.position_size(capital, eff_risk, atr_val, price)
                 if invest <= 0 or invest > capital:
                     continue
-                g = s["g"]
                 fill = price * (1 + slip * sig_now)
                 units = invest / fill
-                atr_val = float(s["atr"].loc[ts]) if s["atr"] is not None and ts in s["atr"].index else None
                 take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
                 capital -= invest
                 open_positions[aid] = rk.Position(

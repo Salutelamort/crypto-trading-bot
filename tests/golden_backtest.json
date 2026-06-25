@@ -373,5 +373,380 @@
       "alpha": -0.1385
     },
     "robustness": 0.25
+  },
+  "mean_reversion_cd6_vt": {
+    "train": {
+      "sharpe": -1.426,
+      "sortino": -0.751,
+      "calmar": -1.221,
+      "profit_factor": 0.727,
+      "total_return": -0.0289,
+      "max_drawdown": 0.041,
+      "win_rate": 0.505,
+      "num_trades": 91,
+      "alpha": -3.2185
+    },
+    "test": {
+      "sharpe": 0.918,
+      "sortino": 0.789,
+      "calmar": 5.954,
+      "profit_factor": 1.376,
+      "total_return": 0.0046,
+      "max_drawdown": 0.0196,
+      "win_rate": 0.551,
+      "num_trades": 94,
+      "alpha": -0.1175
+    },
+    "robustness": 0.25
+  },
+  "momentum_cd6_vt": {
+    "train": {
+      "sharpe": 1.14,
+      "sortino": 0.916,
+      "calmar": 1.891,
+      "profit_factor": 1.282,
+      "total_return": 0.0379,
+      "max_drawdown": 0.0357,
+      "win_rate": 0.454,
+      "num_trades": 97,
+      "alpha": -3.1517
+    },
+    "test": {
+      "sharpe": -1.049,
+      "sortino": -0.714,
+      "calmar": -0.418,
+      "profit_factor": 0.919,
+      "total_return": -0.0062,
+      "max_drawdown": 0.0351,
+      "win_rate": 0.407,
+      "num_trades": 100,
+      "alpha": -0.1283
+    },
+    "robustness": 0.25
+  },
+  "breakout_cd6_vt": {
+    "train": {
+      "sharpe": 0.501,
+      "sortino": 0.435,
+      "calmar": 0.924,
+      "profit_factor": 1.112,
+      "total_return": 0.0178,
+      "max_drawdown": 0.034,
+      "win_rate": 0.361,
+      "num_trades": 72,
+      "alpha": -3.1718
+    },
+    "test": {
+      "sharpe": -1.233,
+      "sortino": -0.759,
+      "calmar": 3.256,
+      "profit_factor": 1.087,
+      "total_return": -0.0064,
+      "max_drawdown": 0.046,
+      "win_rate": 0.369,
+      "num_trades": 74,
+      "alpha": -0.1285
+    },
+    "robustness": 0.25
+  },
+  "ma_cross_cd6_vt": {
+    "train": {
+      "sharpe": 0.663,
+      "sortino": 0.586,
+      "calmar": 0.931,
+      "profit_factor": 1.143,
+      "total_return": 0.0238,
+      "max_drawdown": 0.0451,
+      "win_rate": 0.36,
+      "num_trades": 75,
+      "alpha": -3.1659
+    },
+    "test": {
+      "sharpe": -2.695,
+      "sortino": -2.037,
+      "calmar": -2.982,
+      "profit_factor": 0.616,
+      "total_return": -0.0203,
+      "max_drawdown": 0.0438,
+      "win_rate": 0.321,
+      "num_trades": 80,
+      "alpha": -0.1424
+    },
+    "robustness": 0.25
+  },
+  "pullback_trend_cd6_vt": {
+    "train": {
+      "sharpe": -1.296,
+      "sortino": -0.601,
+      "calmar": -1.001,
+      "profit_factor": 0.75,
+      "total_return": -0.0219,
+      "max_drawdown": 0.0381,
+      "win_rate": 0.524,
+      "num_trades": 84,
+      "alpha": -3.2116
+    },
+    "test": {
+      "sharpe": -2.423,
+      "sortino": -0.965,
+      "calmar": -3.208,
+      "profit_factor": 0.686,
+      "total_return": -0.0054,
+      "max_drawdown": 0.0137,
+      "win_rate": 0.406,
+      "num_trades": 73,
+      "alpha": -0.1276
+    },
+    "robustness": 0.25
+  },
+  "failure_test_cd6_vt": {
+    "train": {
+      "sharpe": -0.068,
+      "sortino": -0.041,
+      "calmar": -0.09,
+      "profit_factor": 0.981,
+      "total_return": -0.0021,
+      "max_drawdown": 0.0406,
+      "win_rate": 0.378,
+      "num_trades": 74,
+      "alpha": -3.1917
+    },
+    "test": {
+      "sharpe": -2.928,
+      "sortino": -1.793,
+      "calmar": -3.463,
+      "profit_factor": 0.59,
+      "total_return": -0.0174,
+      "max_drawdown": 0.0416,
+      "win_rate": 0.33,
+      "num_trades": 90,
+      "alpha": -0.1395
+    },
+    "robustness": 0.25
+  },
+  "breakout_retest_cd6_vt": {
+    "train": {
+      "sharpe": -1.195,
+      "sortino": -0.391,
+      "calmar": -0.972,
+      "profit_factor": 0.7,
+      "total_return": -0.012,
+      "max_drawdown": 0.0216,
+      "win_rate": 0.525,
+      "num_trades": 40,
+      "alpha": -3.2017
+    },
+    "test": {
+      "sharpe": -4.287,
+      "sortino": -1.228,
+      "calmar": -5.894,
+      "profit_factor": 0.215,
+      "total_return": -0.0131,
+      "max_drawdown": 0.0176,
+      "win_rate": 0.334,
+      "num_trades": 43,
+      "alpha": -0.1353
+    },
+    "robustness": 0.25
+  },
+  "donchian_trend_cd6_vt": {
+    "train": {
+      "sharpe": -0.637,
+      "sortino": -0.47,
+      "calmar": -0.81,
+      "profit_factor": 0.841,
+      "total_return": -0.0219,
+      "max_drawdown": 0.0471,
+      "win_rate": 0.355,
+      "num_trades": 62,
+      "alpha": -3.2116
+    },
+    "test": {
+      "sharpe": -1.357,
+      "sortino": -0.781,
+      "calmar": -0.411,
+      "profit_factor": 0.751,
+      "total_return": -0.0077,
+      "max_drawdown": 0.0313,
+      "win_rate": 0.314,
+      "num_trades": 63,
+      "alpha": -0.1298
+    },
+    "robustness": 0.25
+  },
+  "vol_breakout_cd6_vt": {
+    "train": {
+      "sharpe": 1.415,
+      "sortino": 0.291,
+      "calmar": 6.575,
+      "profit_factor": 4.992,
+      "total_return": 0.0045,
+      "max_drawdown": 0.0012,
+      "win_rate": 0.667,
+      "num_trades": 3,
+      "alpha": -3.1851
+    },
+    "test": {
+      "sharpe": -2.544,
+      "sortino": -0.273,
+      "calmar": -5.691,
+      "profit_factor": 0.151,
+      "total_return": -0.0023,
+      "max_drawdown": 0.0041,
+      "win_rate": 0.125,
+      "num_trades": 7,
+      "alpha": -0.1245
+    },
+    "robustness": 0.25
+  },
+  "mtf_trend_cd6_vt": {
+    "train": {
+      "sharpe": 0.601,
+      "sortino": 0.477,
+      "calmar": 0.737,
+      "profit_factor": 1.14,
+      "total_return": 0.0196,
+      "max_drawdown": 0.0469,
+      "win_rate": 0.369,
+      "num_trades": 65,
+      "alpha": -3.1701
+    },
+    "test": {
+      "sharpe": -2.331,
+      "sortino": -1.437,
+      "calmar": -0.883,
+      "profit_factor": 0.706,
+      "total_return": -0.014,
+      "max_drawdown": 0.05,
+      "win_rate": 0.347,
+      "num_trades": 63,
+      "alpha": -0.1361
+    },
+    "robustness": 0.25
+  },
+  "wyckoff_breakout_cd6_vt": {
+    "train": {
+      "sharpe": 0.0,
+      "sortino": 0.0,
+      "calmar": 0.0,
+      "profit_factor": 0.0,
+      "total_return": 0.0,
+      "max_drawdown": -0.0,
+      "win_rate": 0.0,
+      "num_trades": 0,
+      "alpha": -3.1897
+    },
+    "test": {
+      "sharpe": -99.0,
+      "sortino": -99.0,
+      "calmar": -99.0,
+      "profit_factor": 0.0,
+      "total_return": 0.0,
+      "max_drawdown": 0.0,
+      "win_rate": 0.0,
+      "num_trades": 0,
+      "alpha": 0.0
+    },
+    "robustness": 0.0
+  },
+  "williams_volatility_cd6_vt": {
+    "train": {
+      "sharpe": 1.112,
+      "sortino": 0.956,
+      "calmar": 1.804,
+      "profit_factor": 1.3,
+      "total_return": 0.0405,
+      "max_drawdown": 0.0399,
+      "win_rate": 0.386,
+      "num_trades": 88,
+      "alpha": -3.1492
+    },
+    "test": {
+      "sharpe": -0.625,
+      "sortino": -0.465,
+      "calmar": 0.26,
+      "profit_factor": 0.921,
+      "total_return": -0.0037,
+      "max_drawdown": 0.0318,
+      "win_rate": 0.404,
+      "num_trades": 82,
+      "alpha": -0.1258
+    },
+    "robustness": 0.25
+  },
+  "supertrend_cd6_vt": {
+    "train": {
+      "sharpe": 0.177,
+      "sortino": 0.159,
+      "calmar": 0.152,
+      "profit_factor": 1.033,
+      "total_return": 0.0053,
+      "max_drawdown": 0.0616,
+      "win_rate": 0.392,
+      "num_trades": 74,
+      "alpha": -3.1843
+    },
+    "test": {
+      "sharpe": -1.028,
+      "sortino": -0.703,
+      "calmar": 0.882,
+      "profit_factor": 1.002,
+      "total_return": -0.0064,
+      "max_drawdown": 0.0345,
+      "win_rate": 0.345,
+      "num_trades": 79,
+      "alpha": -0.1286
+    },
+    "robustness": 0.25
+  },
+  "macd_adx_cd6_vt": {
+    "train": {
+      "sharpe": -0.923,
+      "sortino": -0.587,
+      "calmar": -0.998,
+      "profit_factor": 0.776,
+      "total_return": -0.0261,
+      "max_drawdown": 0.0453,
+      "win_rate": 0.344,
+      "num_trades": 61,
+      "alpha": -3.2157
+    },
+    "test": {
+      "sharpe": -1.572,
+      "sortino": -0.862,
+      "calmar": 2.059,
+      "profit_factor": 1.349,
+      "total_return": -0.0085,
+      "max_drawdown": 0.0231,
+      "win_rate": 0.34,
+      "num_trades": 61,
+      "alpha": -0.1307
+    },
+    "robustness": 0.25
+  },
+  "breakout_cd0_vt": {
+    "train": {
+      "sharpe": -0.943,
+      "sortino": -0.922,
+      "calmar": -1.0,
+      "profit_factor": 0.838,
+      "total_return": -0.046,
+      "max_drawdown": 0.0793,
+      "win_rate": 0.328,
+      "num_trades": 125,
+      "alpha": -3.2357
+    },
+    "test": {
+      "sharpe": -1.635,
+      "sortino": -1.488,
+      "calmar": -1.062,
+      "profit_factor": 0.764,
+      "total_return": -0.0147,
+      "max_drawdown": 0.0573,
+      "win_rate": 0.335,
+      "num_trades": 152,
+      "alpha": -0.1369
+    },
+    "robustness": 0.25
   }
 }

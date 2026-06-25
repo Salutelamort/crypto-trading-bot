@@ -90,16 +90,21 @@ METRIC_KEYS = ["sharpe", "sortino", "calmar", "profit_factor", "total_return",
 
 def compute():
     df = synthetic_df()
-    c = cfg()
+    base = cfg()
+    # второй конфиг — с волатильность-таргетингом (защищаем и этот путь от регрессий)
+    vt = cfg()
+    vt["risk"]["vol_target"] = True
+    vt["risk"]["risk_per_trade"] = 0.005
     result = {}
-    for g in genomes():
-        train_m, test_m, rob = bt.walk_forward_eval(g, df, c)
-        key = f"{g['type']}_cd{g.get('cooldown')}"
-        result[key] = {
-            "train": {k: train_m.get(k) for k in METRIC_KEYS},
-            "test": {k: test_m.get(k) for k in METRIC_KEYS},
-            "robustness": rob,
-        }
+    for label, c in (("", base), ("_vt", vt)):
+        for g in genomes():
+            train_m, test_m, rob = bt.walk_forward_eval(g, df, c)
+            key = f"{g['type']}_cd{g.get('cooldown')}{label}"
+            result[key] = {
+                "train": {k: train_m.get(k) for k in METRIC_KEYS},
+                "test": {k: test_m.get(k) for k in METRIC_KEYS},
+                "robustness": rob,
+            }
     return result
 
 

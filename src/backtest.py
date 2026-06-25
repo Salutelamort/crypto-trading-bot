@@ -15,6 +15,7 @@ import pandas as pd
 from . import genome as gn
 from . import metrics as mt
 from . import indicators as ind
+from . import risk as rk
 
 
 def _effective_risk(genome, risk):
@@ -145,7 +146,9 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
         # --- вход по сигналу (после кулдауна; разворот тоже ждёт «отдыха») ---
         if (not in_pos) and s != 0 and i >= cooldown_until:
             direction = s
-            notional = cash * frac
+            # волатильность-таргетинг: доля от риска до стопа (risk parity)
+            frac_eff = rk.sized_fraction(risk, atr_arr[i], price)
+            notional = cash * frac_eff
             cash -= notional
             entry_exec = price * (1 + slip * direction)
             extreme = high[i] if direction == 1 else low[i]

@@ -95,9 +95,36 @@ def close_pnl(pos: "Position", exit_fill: float, fee: float) -> float:
     return gross - fees
 
 
-def position_size(capital: float, risk_cfg: dict) -> float:
-    """Сколько денег вложить в одну позицию (доля капитала)."""
-    return capital * risk_cfg["position_fraction"]
+def sized_fraction(risk_cfg: dict, atr=None, price=None) -> float:
+    """
+    ВОЛАТИЛЬНОСТЬ-ТАРГЕТИНГ (risk parity по позиции).
+    Доля капитала на сделку считается так, чтобы РИСК ДО СТОПА был одинаковым для
+    любой монеты/таймфрейма: спокойная монета → больше, дёрганая → меньше.
+
+    risk_per_trade — целевой риск (доля капитала), который мы теряем, если цена
+    дойдёт до стопа. Стоп = stop_mult × ATR, значит относительный риск позиции =
+    stop_mult × (ATR/price). Отсюда доля = risk_per_trade / (stop_mult × ATR/price).
+    position_fraction работает как ПОТОЛОК (не вкладываем больше него).
+
+    Если vol_target выключен или нет ATR — откат на фиксированную position_fraction.
+    """
+    cap = risk_cfg["position_fraction"]   # потолок доли на сделку
+    # atr != atr → NaN (ранние бары, где ATR ещё не посчитан) → откат на потолок
+    if (not risk_cfg.get("vol_target") or atr is None or price is None
+            or atr != atr or price != price or atr <= 0 or price <= 0):
+        return cap
+    stop_mult = risk_cfg.get("atr_stop_mult", 2.0)
+    rpt = risk_cfg.get("risk_per_trade", 0.005)
+    rel_vol = atr / price
+    if stop_mult <= 0 or rel_vol <= 0:
+        return cap
+    raw = rpt / (stop_mult * rel_vol)
+    return max(0.0, min(raw, cap))
+
+
+def position_size(capital: float, risk_cfg: dict, atr=None, price=None) -> float:
+    """Сколько денег вложить в одну позицию (с учётом волатильность-таргетинга)."""
+    return capital * sized_fraction(risk_cfg, atr, price)
 
 
 def can_open(open_positions: int, risk_cfg: dict) -> bool:

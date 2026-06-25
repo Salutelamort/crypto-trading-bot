@@ -219,12 +219,16 @@ def tick(conn, cfg, verbose=True):
                 and not guard_block and sym not in locked \
                 and sym_count < risk_cfg.get("max_positions_per_symbol", 99) \
                 and rk.can_open(len(positions), risk_cfg):
-            invest = rk.position_size(capital, risk_cfg)
+            atr_val = float(ind.atr(df, risk_cfg.get("atr_period", 14)).iloc[-1]) \
+                if risk_cfg.get("atr_stop") else None
+            # волатильность-таргетинг: размер от риска до стопа (стоп — ген агента)
+            eff_risk = dict(risk_cfg)
+            if g.get("stop_atr"):
+                eff_risk["atr_stop_mult"] = g["stop_atr"]
+            invest = rk.position_size(capital, eff_risk, atr_val, price)
             if 0 < invest <= capital:
                 fill = price * (1 + slip * sig)
                 units = invest / fill
-                atr_val = float(ind.atr(df, risk_cfg.get("atr_period", 14)).iloc[-1]) \
-                    if risk_cfg.get("atr_stop") else None
                 take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
                 capital -= invest
                 p = rk.Position(aid, sym, fill, units, direction=sig,
