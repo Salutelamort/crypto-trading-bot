@@ -19,6 +19,7 @@ from . import backtest as bt
 from . import genome as gn
 from . import risk as rk
 from . import macro_feed
+from . import indicators as ind
 
 
 def _macro_blocks_entries(cfg) -> bool:
@@ -48,7 +49,11 @@ def run_paper(conn, cfg, data_by_symbol):
     fee = cfg["costs"]["fee_pct"]
     slip = cfg["costs"]["slippage_pct"]
 
-    # Готовим для каждого агента: out-of-sample df + предрассчитанный сигнал.
+    allow_short = risk_cfg.get("allow_short", False)
+    atr_period = risk_cfg.get("atr_period", 14)
+    use_atr = risk_cfg.get("atr_stop", False)
+
+    # Готовим для каждого агента: out-of-sample df + предрассчитанный сигнал + ATR.
     streams = []
     for a in promoted:
         sym = a["symbol"]
@@ -57,8 +62,9 @@ def run_paper(conn, cfg, data_by_symbol):
         _, test_df = bt.split_train_test(data_by_symbol[sym], cfg["train_ratio"])
         g = json.loads(a["genome"])
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
-        sig = gn.signal(g, test_df).shift(delay).fillna(0).astype(int)
-        streams.append({"agent": a, "df": test_df, "sig": sig, "g": g})
+        sig = gn.signal(g, test_df, allow_short).shift(delay).fillna(0).astype(int)
+        atr_ser = ind.atr(test_df, atr_period) if use_atr else None
+        streams.append({"agent": a, "df": test_df, "sig": sig, "g": g, "atr": atr_ser})
 
     if not streams:
         print("Нет данных для продвинутых агентов.")
@@ -67,6 +73,7 @@ def run_paper(conn, cfg, data_by_symbol):
     # Единая временная шкала (объединение индексов всех потоков).
     timeline = sorted(set().union(*[set(s["df"].index) for s in streams]))
     open_positions = {}     # agent_id -> Position
+    cooldown_left = {}      # agent_id -> сколько баров ещё «отдыхать» после выхода
     realized_pnl = 0.0
     trade_count = 0
     wins = 0
@@ -92,52 +99,64 @@ def run_paper(conn, cfg, data_by_symbol):
 
             # Текущий капитал портфеля (mark-to-market) и просадка.
             equity = capital + sum(
-                p.units * last_price.get(p.symbol, p.entry_price)
+                p.value(last_price.get(p.symbol, p.entry_price))
                 for p in open_positions.values())
             peak_equity = max(peak_equity, equity)
             dd_halt = (peak_equity - equity) / peak_equity > dd_limit if peak_equity else False
             if dd_halt:
                 dd_halt_bars += 1
 
+            sig_now = int(s["sig"].loc[ts])
+
             # 1. Управление открытой позицией (риск приоритетнее сигнала).
             if pos is not None:
-                should_exit, reason = pos.exit_check(price, risk_cfg)
-                if not should_exit and int(s["sig"].loc[ts]) == 0:
-                    should_exit, reason = True, "signal"
+                should_exit, reason, exit_price = pos.exit_check_hl(price, price, price, risk_cfg)
+                if not should_exit and sig_now != pos.direction:
+                    should_exit, reason, exit_price = True, "signal", price
                 if should_exit:
-                    fill = price * (1 - slip)
-                    proceeds = pos.units * fill * (1 - fee)
-                    cost_basis = pos.units * pos.entry_price
-                    pnl = proceeds - cost_basis
-                    capital += proceeds
+                    fill = exit_price * (1 - slip * pos.direction)
+                    pnl = rk.close_pnl(pos, fill, fee)
+                    capital += pos.notional + pnl
                     realized_pnl += pnl
                     trade_count += 1
                     wins += 1 if pnl > 0 else 0
-                    db.log_paper_trade(conn, aid, a["symbol"], "SELL",
+                    side = "SELL" if pos.direction == 1 else "COVER"
+                    db.log_paper_trade(conn, aid, a["symbol"], side,
                                        fill, pos.units, pos.units * fill * fee,
                                        round(pnl, 2), reason)
                     del open_positions[aid]
+                    cooldown_left[aid] = int(s["g"].get("cooldown", 0))
+            elif aid not in open_positions and cooldown_left.get(aid, 0) > 0:
+                cooldown_left[aid] -= 1   # «отдыхаем» после выхода
 
-            # 2. Вход: с учётом лимита позиций, макро-стража И стоп-крана просадки.
-            elif (not macro_block) and (not dd_halt) and int(s["sig"].loc[ts]) == 1 \
+            # 2. Вход (long или short): лимит, макро-страж, стоп-кран И кулдаун.
+            if aid not in open_positions and (not macro_block) and (not dd_halt) \
+                    and sig_now != 0 and cooldown_left.get(aid, 0) <= 0 \
                     and rk.can_open(len(open_positions), risk_cfg):
                 invest = rk.position_size(capital, risk_cfg)
                 if invest <= 0 or invest > capital:
                     continue
-                fill = price * (1 + slip)
-                units = (invest * (1 - fee)) / fill
+                g = s["g"]
+                fill = price * (1 + slip * sig_now)
+                units = invest / fill
+                atr_val = float(s["atr"].loc[ts]) if s["atr"] is not None and ts in s["atr"].index else None
+                take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
                 capital -= invest
-                open_positions[aid] = rk.Position(aid, a["symbol"], fill, units)
-                db.log_paper_trade(conn, aid, a["symbol"], "BUY",
+                open_positions[aid] = rk.Position(
+                    aid, a["symbol"], fill, units, direction=sig_now, notional=invest,
+                    atr=atr_val, stop_mult=g.get("stop_atr"), take_mult=take_mult,
+                    trail_mult=g.get("trail_atr"))
+                side = "BUY" if sig_now == 1 else "SHORT"
+                db.log_paper_trade(conn, aid, a["symbol"], side,
                                    fill, units, invest * fee, None, "signal")
 
-    # Закрываем остатки по последней цене (mark-to-market).
+    # Закрываем остатки по последней цене (mark-to-market, long и short).
     for aid, pos in list(open_positions.items()):
-        last_price = float(streams[0]["df"]["close"].iloc[-1])
+        px = float(streams[0]["df"]["close"].iloc[-1])
         for s in streams:
             if s["agent"]["id"] == aid:
-                last_price = float(s["df"]["close"].iloc[-1])
-        capital += pos.units * last_price
+                px = float(s["df"]["close"].iloc[-1])
+        capital += pos.value(px)
 
     start = float(cfg["paper"]["starting_capital"])
     total_ret = capital / start - 1

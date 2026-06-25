@@ -20,6 +20,7 @@ import time
 import json
 
 from . import db, data_feed as feed, genome as gn, risk as rk, macro_feed, news_feed
+from . import indicators as ind
 from .db import now_iso
 
 
@@ -44,7 +45,12 @@ def _save_account(conn, capital, peak):
 def _load_positions(conn):
     pos = {}
     for r in conn.execute("SELECT * FROM live_positions").fetchall():
-        p = rk.Position(r["agent_id"], r["symbol"], r["entry_price"], r["units"])
+        keys = r.keys()
+        direction = r["direction"] if "direction" in keys and r["direction"] else 1
+        notional = r["notional"] if "notional" in keys and r["notional"] else r["units"] * r["entry_price"]
+        atr = r["atr"] if "atr" in keys else None
+        p = rk.Position(r["agent_id"], r["symbol"], r["entry_price"], r["units"],
+                        direction=direction, notional=notional, atr=atr)
         p.peak_price = r["peak_price"]
         pos[r["agent_id"]] = p
     return pos
@@ -53,9 +59,10 @@ def _load_positions(conn):
 def _save_position(conn, p):
     conn.execute(
         "INSERT OR REPLACE INTO live_positions "
-        "(agent_id,symbol,entry_price,units,peak_price,opened_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (p.agent_id, p.symbol, p.entry_price, p.units, p.peak_price, now_iso()))
+        "(agent_id,symbol,entry_price,units,peak_price,opened_at,direction,notional,atr) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (p.agent_id, p.symbol, p.entry_price, p.units, p.peak_price, now_iso(),
+         p.direction, p.notional, p.atr))
     conn.commit()
 
 
@@ -141,12 +148,14 @@ def tick(conn, cfg, verbose=True):
             if verbose:
                 print(f"  [!] нет данных {s}: {e}")
 
-    # текущий капитал и просадка
+    allow_short = risk_cfg.get("allow_short", False)
+
+    # текущий капитал и просадка (mark-to-market, работает для long и short)
     def equity_now():
         eq = capital
         for p in positions.values():
             if p.symbol in data:
-                eq += p.units * float(data[p.symbol]["close"].iloc[-1])
+                eq += p.value(float(data[p.symbol]["close"].iloc[-1]))
         return eq
 
     eq = equity_now()
@@ -167,42 +176,49 @@ def tick(conn, cfg, verbose=True):
         # реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не на текущий, формирующийся) —
         # не зависим от скорости доступа к бирже.
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
-        sig = int(gn.signal(g, df).shift(delay).fillna(0).iloc[-1])
+        sig = int(gn.signal(g, df, allow_short).shift(delay).fillna(0).iloc[-1])
         pos = positions.get(aid)
 
         # 1. управление позицией — внутрибарно по 1m свечам (стоп как реальный ордер)
         if pos is not None:
             hi, lo = minute_hl(sym, price)
             should_exit, reason, exit_price = pos.exit_check_hl(hi, lo, price, risk_cfg)
-            if not should_exit and sig == 0:
+            if not should_exit and sig != pos.direction:  # сигнал ушёл/развернулся
                 should_exit, reason, exit_price = True, "signal", price
             if should_exit:
-                fill = exit_price * (1 - slip)
-                proceeds = pos.units * fill * (1 - fee)
-                pnl = proceeds - pos.units * pos.entry_price
-                capital += proceeds
-                db.log_paper_trade(conn, aid, sym, "SELL", fill, pos.units,
+                fill = exit_price * (1 - slip * pos.direction)
+                pnl = rk.close_pnl(pos, fill, fee)
+                capital += pos.notional + pnl
+                side = "SELL" if pos.direction == 1 else "COVER"
+                db.log_paper_trade(conn, aid, sym, side, fill, pos.units,
                                    pos.units * fill * fee, round(pnl, 2), reason)
                 _del_position(conn, aid)
                 del positions[aid]
-                actions.append(f"SELL #{aid} {sym} @ {fill:.2f} ({reason}) PnL {pnl:+.2f}")
+                actions.append(f"{side} #{aid} {sym} @ {fill:.2f} ({reason}) PnL {pnl:+.2f}")
             else:
-                _save_position(conn, pos)  # сохранить обновлённый peak_price
+                _save_position(conn, pos)  # сохранить обновлённый extreme
 
-        # 2. вход по сигналу
-        elif sig == 1 and not macro_block and not news_block and not dd_halt \
+        # 2. вход по сигналу (long или short)
+        elif sig != 0 and not macro_block and not news_block and not dd_halt \
                 and rk.can_open(len(positions), risk_cfg):
             invest = rk.position_size(capital, risk_cfg)
             if 0 < invest <= capital:
-                fill = price * (1 + slip)
-                units = invest * (1 - fee) / fill
+                fill = price * (1 + slip * sig)
+                units = invest / fill
+                atr_val = float(ind.atr(df, risk_cfg.get("atr_period", 14)).iloc[-1]) \
+                    if risk_cfg.get("atr_stop") else None
+                take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
                 capital -= invest
-                p = rk.Position(aid, sym, fill, units)
+                p = rk.Position(aid, sym, fill, units, direction=sig,
+                                notional=invest, atr=atr_val,
+                                stop_mult=g.get("stop_atr"), take_mult=take_mult,
+                                trail_mult=g.get("trail_atr"))
                 positions[aid] = p
                 _save_position(conn, p)
-                db.log_paper_trade(conn, aid, sym, "BUY", fill, units,
+                side = "BUY" if sig == 1 else "SHORT"
+                db.log_paper_trade(conn, aid, sym, side, fill, units,
                                    invest * fee, None, "signal")
-                actions.append(f"BUY  #{aid} {sym} @ {fill:.2f} (вложено {invest:.2f})")
+                actions.append(f"{side} #{aid} {sym} @ {fill:.2f} (вложено {invest:.2f})")
 
     eq = equity_now()
     peak = max(peak, eq)

@@ -17,11 +17,16 @@ PERIODS_PER_YEAR = {
 
 
 def compute_metrics(equity: pd.Series, returns: pd.Series,
-                    trade_results: list, timeframe: str) -> dict:
+                    trade_results: list, timeframe: str,
+                    buy_hold: float = 0.0) -> dict:
     """
     equity        — кривая капитала (Series)
     returns       — поэкземплярные доходности портфеля
     trade_results — список PnL завершённых сделок (для winrate)
+    buy_hold      — доходность пассивного "купи и держи" за тот же период.
+                    alpha = доходность стратегии минус buy_hold (сколько мы добавили
+                    сверх рынка). В медвежий рынок положительная alpha = сохранение
+                    капитала, даже если абсолютная доходность отрицательна.
     """
     ann = PERIODS_PER_YEAR.get(timeframe, 8_760)
 
@@ -50,6 +55,8 @@ def compute_metrics(equity: pd.Series, returns: pd.Series,
         "max_drawdown": round(max_drawdown, 4),
         "win_rate": round(win_rate, 3),
         "num_trades": len(trade_results),
+        "buy_hold": round(buy_hold, 4),
+        "alpha": round(total_return - buy_hold, 4),
     }
 
 

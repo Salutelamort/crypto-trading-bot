@@ -43,6 +43,29 @@ def _evaluate(genome, df, cfg):
     return bt.walk_forward_eval(genome, df, cfg)
 
 
+def _select_survivors(ranked, n, max_per_sym):
+    """Выбирает n выживших с КВОТОЙ на символ, чтобы пул не схлопывался в одну
+    монету (диверсификация генофонда). Если разнообразия не хватает — добивает
+    лучшими из оставшихся."""
+    kept, per = [], {}
+    for a in ranked:
+        if len(kept) >= n:
+            break
+        s = a["symbol"]
+        if per.get(s, 0) >= max_per_sym:
+            continue
+        kept.append(a)
+        per[s] = per.get(s, 0) + 1
+    if len(kept) < n:
+        ids = {a["id"] for a in kept}
+        for a in ranked:
+            if len(kept) >= n:
+                break
+            if a["id"] not in ids:
+                kept.append(a)
+    return kept
+
+
 def _proven_symbols(conn, cfg, symbols):
     """Символы с ДОКАЗАННЫМ преимуществом (как у piratastuertos): где хоть один
     агент показал OOS Sharpe выше порога. Пока таких нет — возвращаем все (bootstrap)."""
@@ -53,35 +76,59 @@ def _proven_symbols(conn, cfg, symbols):
     return sorted(proven) if proven else symbols
 
 
-def _anti_clone(conn, cfg):
+def _oos_returns(genome, df, cfg):
+    """Доходности агента на out-of-sample участке (для матрицы корреляций)."""
+    cut = int(len(df) * cfg["train_ratio"])
+    oos = df.iloc[cut:]
+    delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
+    allow_short = cfg["risk"].get("allow_short", False)
+    sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int).iloc[cut:]
+    m = bt.run(genome, oos, cfg, sig=sig)
+    return m["equity"].pct_change().fillna(0.0)
+
+
+def _anti_clone(conn, cfg, data_by_symbol):
     """
-    Убиваем клонов: если equity-кривые двух живых агентов сильно коррелируют,
-    оставляем того, у кого лучше out-of-sample Sharpe.
+    ДИВЕРСИФИКАЦИЯ. Убиваем клонов по РЕАЛЬНОЙ корреляции кривых дохода
+    (а не по близости Sharpe, как раньше — то пропускало однотипных).
+
+    Принцип Тома Бассо («Всепогодный трейдер»): портфель должен пережить любой
+    режим → стратегии должны быть НЕПОХОЖИ. Если два агента зарабатывают/теряют
+    в одни и те же моменты (corr > порога) — оставляем более сильного (по alpha,
+    затем Sharpe), второго в расход. Это касается и РАЗНЫХ символов/типов:
+    важна именно совместная динамика дохода, а не формальное совпадение генома.
     """
     thresh = cfg["evolution"]["anti_clone_corr"]
     alive = db.get_agents(conn, "candidate")
-    # нужны equity-кривые — пересчитывать дорого, поэтому корреляцию приближаем
-    # по близости геномов того же типа/символа + близкому test_sharpe.
-    killed = 0
-    for i in range(len(alive)):
-        for j in range(i + 1, len(alive)):
-            a, b = alive[i], alive[j]
-            if a["status"] != "candidate" or b["status"] != "candidate":
-                continue
-            ga, gb = json.loads(a["genome"]), json.loads(b["genome"])
-            if ga["type"] != gb["type"] or a["symbol"] != b["symbol"]:
-                continue
-            sa = a["test_sharpe"] or -99
-            sb = b["test_sharpe"] or -99
-            # одинаковый тип+символ и почти идентичный test_sharpe => клон
-            if abs(sa - sb) < (1 - thresh):
-                weaker = a if sa < sb else b
-                db.set_agent_status(conn, weaker["id"], "killed")
-                db.log_decision(conn, weaker["id"], "kill", "rules",
-                                f"анти-клон: дубликат {ga['type']}/{a['symbol']} "
-                                f"со слабым test_sharpe ({min(sa, sb):.2f})")
-                weaker["status"] = "killed"
-                killed += 1
+    rets = {}
+    for a in alive:
+        sym = a["symbol"]
+        if sym not in data_by_symbol:
+            continue
+        try:
+            rets[a["id"]] = _oos_returns(json.loads(a["genome"]), data_by_symbol[sym], cfg)
+        except Exception:  # noqa
+            continue
+    if len(rets) < 2:
+        return 0
+
+    R = pd.DataFrame(rets).fillna(0.0)
+    corr = R.corr()
+    score = {a["id"]: ((a["test_alpha"] if a["test_alpha"] is not None else -99),
+                       (a["test_sharpe"] if a["test_sharpe"] is not None else -99))
+             for a in alive}
+    # от сильнейших к слабым: сильный занимает «нишу», похожие на него — убиваются
+    order = sorted(rets.keys(), key=lambda i: score[i], reverse=True)
+    kept, killed = [], 0
+    for i in order:
+        if any(abs(corr.loc[i, j]) > thresh for j in kept):
+            db.set_agent_status(conn, i, "killed")
+            db.log_decision(conn, i, "kill", "rules",
+                            f"анти-клон: корреляция дохода > {thresh} с более сильным агентом "
+                            f"(нет диверсификации)")
+            killed += 1
+        else:
+            kept.append(i)
     return killed
 
 
@@ -90,7 +137,11 @@ def evolve(conn, cfg, data_by_symbol):
     data_by_symbol: {symbol: DataFrame OHLCV}
     Запускает несколько поколений эволюции.
     """
-    rng = random.Random(42)  # фиксируем seed для воспроизводимости
+    # РАНЬШЕ здесь был фиксированный seed(42): каждый облачный прогон генерировал
+    # ОДНИ И ТЕ ЖЕ случайные геномы → 16k агентов, но реального поиска не было
+    # (бег на месте). Теперь seed случайный — пространство стратегий реально
+    # исследуется от прогона к прогону. Выжившие накапливаются в БД (эволюция).
+    rng = random.Random()
     ev = cfg["evolution"]
     quarantined = db.quarantined_symbols(conn)
     symbols = [s for s in cfg["symbols"]
@@ -106,8 +157,9 @@ def evolve(conn, cfg, data_by_symbol):
         alive = db.get_agents(conn, "candidate")
         need = ev["population_size"] - len(alive)
         min_tr = ev.get("min_trades", 0)
-        survivors = sorted(alive, key=lambda a: _fitness(a, min_tr),
-                           reverse=True)[:ev["survivors"]]
+        max_per_sym = ev.get("max_survivors_per_symbol", ev["survivors"])
+        ranked_alive = sorted(alive, key=lambda a: _fitness(a, min_tr), reverse=True)
+        survivors = _select_survivors(ranked_alive, ev["survivors"], max_per_sym)
 
         # Генерируем новых ТОЛЬКО на символах с доказанным преимуществом
         # (как piratastuertos). Пока таких нет — по всем (фаза bootstrap).
@@ -138,19 +190,22 @@ def evolve(conn, cfg, data_by_symbol):
             aid = db.insert_agent(conn, g, sym, cfg["timeframe"])
             db.update_agent_metrics(conn, aid, train_m, test_m, cons)
 
-        # 3. Отбор: убиваем всё, что вне топа по train_sharpe.
+        # 3. Отбор: выживают лучшие С КВОТОЙ на символ (диверсификация генофонда).
         alive = db.get_agents(conn, "candidate")
         ranked = sorted(alive, key=lambda a: _fitness(a, min_tr), reverse=True)
-        for a in ranked[ev["survivors"]:]:
+        keep_ids = {a["id"] for a in _select_survivors(ranked, ev["survivors"], max_per_sym)}
+        for a in ranked:
+            if a["id"] in keep_ids:
+                continue
             db.set_agent_status(conn, a["id"], "killed")
             reason = (f"мало сделок ({a['train_trades']} < {min_tr})"
                       if (a["train_trades"] or 0) < min_tr
-                      else f"train_sharpe {a['train_sharpe']} вне топ-{ev['survivors']}")
+                      else f"train_sharpe {a['train_sharpe']} вне топ-{ev['survivors']} (с квотой на символ)")
             db.log_decision(conn, a["id"], "kill", "rules",
                             f"эволюционный отбор: {reason}")
 
-        # 4. Анти-клон фильтр.
-        cloned = _anti_clone(conn, cfg)
+        # 4. Анти-клон фильтр (по реальной корреляции дохода → диверсификация).
+        cloned = _anti_clone(conn, cfg, data_by_symbol)
 
         survivors_now = db.get_agents(conn, "candidate")
         print(f"  Живых агентов: {len(survivors_now)} | убито клонов: {cloned}")

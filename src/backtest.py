@@ -14,94 +14,155 @@
 import pandas as pd
 from . import genome as gn
 from . import metrics as mt
+from . import indicators as ind
+
+
+def _effective_risk(genome, risk):
+    """Накладывает ГЕНЫ РИСКА агента поверх базового config (если они есть).
+    Так каждый агент носит собственные стоп/тейк/трейл в единицах ATR,
+    а эволюция их подбирает (совет Карвера: риск от волатильности)."""
+    r = dict(risk)
+    if genome.get("stop_atr"):
+        r["atr_stop_mult"] = genome["stop_atr"]
+    if genome.get("trail_atr"):
+        r["atr_trail_mult"] = genome["trail_atr"]
+    if genome.get("stop_atr") and genome.get("rr"):
+        r["atr_take_mult"] = round(genome["stop_atr"] * genome["rr"], 3)
+    return r
+
+
+def _exit_levels(direction, entry, extreme, atr_val, risk):
+    """
+    Абсолютные уровни выхода для позиции в направлении direction (+1 long / -1 short).
+    extreme — пик (для long) или дно (для short) цены с момента входа (ratcheting trail).
+    Если включён ATR-стоп и atr_val валиден — стоп/тейк/трейл считаются от
+    волатильности (k*ATR), иначе — от фиксированных процентов (старое поведение).
+    Возвращает (effective_stop, take_price) уже как цены.
+    """
+    use_atr = risk.get("atr_stop") and atr_val and atr_val > 0
+    if use_atr:
+        s_off = risk.get("atr_stop_mult", 2.0) * atr_val
+        t_off = risk.get("atr_take_mult", 4.0) * atr_val
+        tr_off = risk.get("atr_trail_mult", 2.5) * atr_val
+    else:
+        s_off = entry * risk["stop_loss_pct"]
+        t_off = entry * risk["take_profit_pct"]
+        tr_off = extreme * risk["trailing_stop_pct"]
+
+    if direction == 1:
+        stop = entry - s_off
+        trail = extreme - tr_off
+        take = entry + t_off
+        return max(stop, trail), take          # ratcheting вверх
+    else:  # short
+        stop = entry + s_off
+        trail = extreme + tr_off
+        take = entry - t_off
+        return min(stop, trail), take          # ratcheting вниз
 
 
 def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     """
-    Симулирует одного агента на исторических данных.
-    Возвращает словарь метрик + кривую equity.
+    Симулирует одного агента на исторических данных. Поддерживает ТРИ состояния:
+    long (+1), short (-1), кэш (0). Возвращает словарь метрик + кривую equity.
     sig — необязательный готовый сигнал (для walk-forward, чтобы не терять прогрев
     индикаторов на границах окон). Если None — считается из генома.
     """
-    risk = cfg["risk"]
+    risk = _effective_risk(genome, cfg["risk"])
     costs = cfg["costs"]
     fee = costs["fee_pct"]
     slip = costs["slippage_pct"]
+    frac = risk["position_fraction"]
+    allow_short = risk.get("allow_short", False)
+    cooldown = int(genome.get("cooldown", 0))   # баров «отдыха» после выхода
 
     # Задержка исполнения: реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не мгновенно).
-    # Это убирает зависимость стратегии от скорости доступа к бирже.
     if sig is None:
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
-        sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
+        sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int)
     else:
         sig = sig.reindex(df.index).fillna(0).astype(int)
+
     close = df["close"].values
     high = df["high"].values
     low = df["low"].values
     n = len(df)
+    atr_arr = ind.atr(df, risk.get("atr_period", 14)).values if risk.get("atr_stop") else [None] * n
 
-    cash = 1.0            # нормированный капитал
-    units = 0.0           # объём в активе
+    cash = 1.0
     in_pos = False
-    entry_price = 0.0
-    peak_price = 0.0      # для trailing stop (ratcheting)
+    direction = 0
+    entry_exec = 0.0      # цена входа с проскальзыванием
+    notional = 0.0        # вложенный капитал (маржа)
+    extreme = 0.0         # пик(long)/дно(short) с момента входа — для trailing
+    atr_entry = None
 
     equity_curve = []
     period_returns = []
     trade_results = []
     prev_equity = cash
+    cooldown_until = 0    # до этого бара новые входы запрещены (анти-переторговля)
+
+    def close_pos(exit_price, reason):
+        nonlocal cash, in_pos, direction, cooldown_until
+        exit_exec = exit_price * (1 - slip * direction)       # слиппедж всегда против нас
+        gross = direction * (exit_exec / entry_exec - 1)      # доходность с учётом стороны
+        pnl = notional * (gross - 2 * fee)                    # комиссия на вход и выход
+        trade_results.append(pnl)
+        cash += notional + pnl
+        in_pos = False
+        direction = 0
+        cooldown_until = i + cooldown
 
     for i in range(n):
         price = close[i]
+        s = int(sig.iloc[i])
 
-        # --- управление открытой позицией: риск имеет приоритет над сигналом ---
-        exit_reason = None
+        # --- управление открытой позицией: риск приоритетнее сигнала ---
         if in_pos:
-            peak_price = max(peak_price, high[i])
+            if direction == 1:
+                extreme = max(extreme, high[i])
+                eff_stop, take = _exit_levels(1, entry_exec, extreme, atr_entry, risk)
+                if low[i] <= eff_stop:
+                    close_pos(eff_stop, "stop")
+                elif high[i] >= take:
+                    close_pos(take, "take_profit")
+                elif s != 1:
+                    close_pos(price, "signal")
+            else:  # short
+                extreme = min(extreme, low[i])
+                eff_stop, take = _exit_levels(-1, entry_exec, extreme, atr_entry, risk)
+                if high[i] >= eff_stop:
+                    close_pos(eff_stop, "stop")
+                elif low[i] <= take:
+                    close_pos(take, "take_profit")
+                elif s != -1:
+                    close_pos(price, "signal")
 
-            stop_price = entry_price * (1 - risk["stop_loss_pct"])
-            trail_price = peak_price * (1 - risk["trailing_stop_pct"])
-            take_price = entry_price * (1 + risk["take_profit_pct"])
-            effective_stop = max(stop_price, trail_price)  # ratcheting: стоп только растёт
-
-            if low[i] <= effective_stop:
-                exit_price = effective_stop
-                exit_reason = "stop_loss" if effective_stop == stop_price else "trailing"
-            elif high[i] >= take_price:
-                exit_price = take_price
-                exit_reason = "take_profit"
-            elif sig.iloc[i] == 0:
-                exit_price = price
-                exit_reason = "signal"
-
-            if exit_reason:
-                fill = exit_price * (1 - slip)            # проскальзывание против нас
-                proceeds = units * fill * (1 - fee)       # минус комиссия
-                pnl = proceeds - (units * entry_price)
-                trade_results.append(pnl)
-                cash += proceeds                          # возврат в общий кэш (не затираем остаток!)
-                units = 0.0
-                in_pos = False
-
-        # --- вход по сигналу ---
-        if (not in_pos) and sig.iloc[i] == 1:
-            fill = price * (1 + slip)                      # проскальзывание против нас
-            invest = cash * risk["position_fraction"]
-            units = (invest * (1 - fee)) / fill
-            cash -= invest
-            entry_price = fill
-            peak_price = high[i]
+        # --- вход по сигналу (после кулдауна; разворот тоже ждёт «отдыха») ---
+        if (not in_pos) and s != 0 and i >= cooldown_until:
+            direction = s
+            notional = cash * frac
+            cash -= notional
+            entry_exec = price * (1 + slip * direction)
+            extreme = high[i] if direction == 1 else low[i]
+            atr_entry = atr_arr[i] if atr_arr[i] is not None else None
             in_pos = True
 
         # --- учёт текущего капитала ---
-        equity = cash + units * price
+        if in_pos:
+            unreal = notional * (direction * (price / entry_exec - 1))
+            equity = cash + notional + unreal
+        else:
+            equity = cash
         equity_curve.append(equity)
         period_returns.append(equity / prev_equity - 1 if prev_equity else 0.0)
         prev_equity = equity
 
     eq = pd.Series(equity_curve, index=df.index)
     rets = pd.Series(period_returns, index=df.index)
-    m = mt.compute_metrics(eq, rets, trade_results, genome["timeframe"])
+    buy_hold = float(close[-1] / close[0] - 1) if n else 0.0
+    m = mt.compute_metrics(eq, rets, trade_results, genome["timeframe"], buy_hold)
     m["equity"] = eq
     return m
 
@@ -126,7 +187,8 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     """
     import numpy as np
     delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
-    full_sig = gn.signal(genome, df).shift(delay).fillna(0).astype(int)
+    allow_short = cfg["risk"].get("allow_short", False)
+    full_sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int)
 
     cut = int(len(df) * cfg["train_ratio"])
     train_df = df.iloc[:cut]
@@ -155,7 +217,7 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     # Агент, который НЕ торгует в out-of-sample, бесполезен → худший балл, не 0.0.
     if total_trades == 0 or not traded:
         test_m = {"sharpe": -99.0, "total_return": 0.0, "win_rate": 0.0,
-                  "num_trades": 0, "max_drawdown": 0.0}
+                  "num_trades": 0, "max_drawdown": 0.0, "buy_hold": 0.0, "alpha": 0.0}
         return train_m, test_m, 0.0
 
     test_m = {
@@ -164,7 +226,11 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
         "win_rate": round(float(np.mean([r["win_rate"] for r in traded])), 3),
         "num_trades": int(total_trades),
         "max_drawdown": round(float(max(r["max_drawdown"] for r in traded)), 4),
+        "buy_hold": round(float(np.mean([r["buy_hold"] for r in traded])), 4),
+        "alpha": round(float(np.mean([r["alpha"] for r in traded])), 4),
     }
-    # устойчивость = доля ТОРГОВАВШИХ окон, которые были прибыльны
-    robustness = round(sum(1 for r in traded if r["total_return"] > 0) / len(traded), 3)
+    # УСТОЙЧИВОСТЬ = доля окон, где агент ОБОГНАЛ "купи и держи" (alpha > 0).
+    # Так ценится не только заработок, но и сохранение капитала в падающем рынке:
+    # потерять -5%, когда рынок упал -40%, — это победа (alpha = +35%).
+    robustness = round(sum(1 for r in traded if r["alpha"] > 0) / len(traded), 3)
     return train_m, test_m, robustness

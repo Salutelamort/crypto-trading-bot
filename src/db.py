@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS agents (
     -- метрики out-of-sample (test) — главный критерий честности
     test_sharpe  REAL, test_return REAL, test_winrate REAL, test_trades INTEGER,
     test_maxdd   REAL,
-    consistency  REAL                  -- test_winrate / train_winrate
+    test_buyhold REAL,                 -- доходность "купи и держи" за OOS-период
+    test_alpha   REAL,                 -- обгон рынка = test_return - test_buyhold
+    consistency  REAL                  -- доля OOS-окон с положительной alpha
 );
 
 -- Решения супервизора. Каждое — с обоснованием (отслеживаемость).
@@ -99,7 +101,24 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """Лёгкие миграции для существующих БД (добавление новых колонок)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    for col in ("test_buyhold", "test_alpha"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {col} REAL")
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(live_positions)").fetchall()}
+    if "direction" not in pcols:
+        conn.execute("ALTER TABLE live_positions ADD COLUMN direction INTEGER DEFAULT 1")
+    if "notional" not in pcols:
+        conn.execute("ALTER TABLE live_positions ADD COLUMN notional REAL")
+    if "atr" not in pcols:
+        conn.execute("ALTER TABLE live_positions ADD COLUMN atr REAL")
+    conn.commit()
 
 
 # ---------- агенты ----------
@@ -118,10 +137,12 @@ def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consisten
         """UPDATE agents SET
             train_sharpe=?, train_return=?, train_winrate=?, train_trades=?,
             test_sharpe=?,  test_return=?,  test_winrate=?,  test_trades=?, test_maxdd=?,
+            test_buyhold=?, test_alpha=?,
             consistency=?
            WHERE id=?""",
         (train["sharpe"], train["total_return"], train["win_rate"], train["num_trades"],
          test["sharpe"],  test["total_return"],  test["win_rate"],  test["num_trades"], test["max_drawdown"],
+         test.get("buy_hold", 0.0), test.get("alpha", 0.0),
          consistency, agent_id),
     )
     conn.commit()

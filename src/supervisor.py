@@ -40,6 +40,7 @@ def _decide(agents, cfg, quarantined):
         dd = s["test_maxdd"] or 1.0
         cons = s["consistency"] or 0.0
         trades = s["test_trades"] or 0
+        alpha = a["test_alpha"] if a["test_alpha"] is not None else -99
 
         # СМЕРТЬ агентов происходит ВНУТРИ эволюции (отбор по приспособленности
         # в evolution.py). Здесь супервизор НЕ убивает — только ДОПУСКАЕТ к живой
@@ -47,20 +48,23 @@ def _decide(agents, cfg, quarantined):
         # накапливается и улучшается между циклами.
 
         # --- ДОПУСК к живой торговле ---
-        max_dd_ok = dd <= sup.get("promote_max_drawdown", 1.0)
-        ok = (ts >= sup["promote_min_sharpe"]
-              and trades >= sup["promote_min_trades"]
-              and cons >= sup["promote_min_consistency"]
-              and max_dd_ok
-              and a["symbol"] not in quarantined)
-        if ok:
+        # База качества (общая для обоих путей): достаточно сделок, низкая просадка,
+        # устойчивый обгон рынка по окнам, символ не в карантине.
+        base_ok = (trades >= sup["promote_min_trades"]
+                   and cons >= sup["promote_min_consistency"]
+                   and dd <= sup.get("promote_max_drawdown", 1.0)
+                   and a["symbol"] not in quarantined)
+        # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha).
+        edge_ok = (ts >= sup["promote_min_sharpe"]
+                   or alpha >= sup.get("promote_min_alpha", 99))
+        if base_ok and edge_ok:
             decisions.append((a["id"], "promote",
-                f"OOS Sharpe {ts:.2f}, просадка {dd:.0%}, сделок {trades}, "
-                f"устойчивость {cons:.0%} окон — стабилен и низкорисков"))
+                f"OOS Sharpe {ts:.2f}, alpha {alpha:+.1%} vs рынок, просадка {dd:.0%}, "
+                f"сделок {trades}, устойчивость {cons:.0%} окон — допущен"))
         else:
             decisions.append((a["id"], "hold",
-                f"не дотягивает (OOS Sharpe {ts:.2f}, просадка {dd:.0%}, "
-                f"trades {trades}, устойчивость {cons:.0%})"))
+                f"не дотягивает (OOS Sharpe {ts:.2f}, alpha {alpha:+.1%}, "
+                f"просадка {dd:.0%}, trades {trades}, устойчивость {cons:.0%})"))
     return decisions
 
 
@@ -74,6 +78,33 @@ def supervise(conn, cfg):
 
     print(f"\nОтбор эволюции оценивает {len(agents)} агентов (правила, без LLM)...")
     decisions = _decide(agents, cfg, quarantined)
+
+    # --- ДИВЕРСИФИКАЦИЯ на уровне допуска ---
+    # Даже после анти-клона ограничиваем концентрацию: не больше N стратегий на
+    # один символ и не больше M всего. Из прошедших ворота берём лучших по alpha,
+    # чтобы живой портфель был распределён, а не сидел в одной монете.
+    sup = cfg["supervisor"]
+    max_per_sym = sup.get("promote_max_per_symbol", 2)
+    max_total = sup.get("promote_max_total", 6)
+    by_id = {a["id"]: a for a in agents}
+    promo = [d for d in decisions if d[1] == "promote"]
+    promo.sort(key=lambda d: (by_id[d[0]]["test_alpha"] if by_id[d[0]]["test_alpha"] is not None else -99),
+               reverse=True)
+    per_sym, taken = {}, 0
+    allowed = set()
+    for d in promo:
+        sym = by_id[d[0]]["symbol"]
+        if taken >= max_total or per_sym.get(sym, 0) >= max_per_sym:
+            continue
+        allowed.add(d[0])
+        per_sym[sym] = per_sym.get(sym, 0) + 1
+        taken += 1
+    # прошедшие ворота, но «лишние» по диверсификации → переводим в hold
+    decisions = [
+        d if not (d[1] == "promote" and d[0] not in allowed)
+        else (d[0], "hold", d[2] + " | не допущен: лимит диверсификации (концентрация)")
+        for d in decisions
+    ]
 
     counts = {"kill": 0, "promote": 0, "hold": 0}
     for agent_id, action, rationale in decisions:
