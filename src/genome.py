@@ -41,6 +41,9 @@ STRATEGY_TYPES = [
     "mtf_trend",          # Брайан Шеннон — Мультитаймфреймный технический анализ
     "wyckoff_breakout",   # Вайкофф / Дэвид Вайс (Сделки на горизонте) — объём+цена
     "williams_volatility",# Ларри Вильямс — Секреты торговли на фьючерсном рынке
+    # добавлено из обзора конкурентов (docs/competitors_ideas.md):
+    "supertrend",         # ATR-трендследование (популярно в Freqtrade/TradingView)
+    "macd_adx",           # MACD-кросс + фильтр силы тренда ADX (не торгуем в боковике)
 ]
 
 
@@ -104,6 +107,15 @@ def random_genome(symbol: str, timeframe: str, rng: random.Random) -> dict:
         g["atr_period"] = rng.choice([5, 10, 14])
         g["k"] = round(rng.uniform(0.5, 1.5), 2)
 
+    # --- Supertrend: ATR-трендследование (направление = сторона позиции). ---
+    elif stype == "supertrend":
+        g["st_period"] = rng.choice([7, 10, 14])
+        g["st_mult"] = round(rng.uniform(2.0, 4.0), 1)
+
+    # --- MACD-кросс, отфильтрованный силой тренда ADX (в боковике — кэш). ---
+    elif stype == "macd_adx":
+        g["adx_min"] = rng.choice([20, 25, 30])   # MACD держим классический 12/26/9
+
     # --- ГЕНЫ РИСКА (общие для всех типов; их подбирает эволюция) ---
     # Карвер: риск измеряется ОТ ВОЛАТИЛЬНОСТИ, а не вслепую. Поэтому стоп/тейк/трейл
     # заданы в единицах ATR и являются частью генома — бот сам ищет оптимум.
@@ -136,6 +148,8 @@ def mutate(genome: dict, rng: random.Random) -> dict:
         g["trail_atr"] = round(max(0.5, g["trail_atr"]), 2)
     if "rr" in g:
         g["rr"] = round(max(1.0, g["rr"]), 1)
+    if "st_mult" in g:
+        g["st_mult"] = round(max(1.0, g["st_mult"]), 1)
     # инварианты
     if g["type"] == "ma_cross":
         g["slow"] = max(g["slow"], g["fast"] + 20)
@@ -305,6 +319,23 @@ def signal(genome: dict, df: pd.DataFrame, allow_short: bool = False) -> pd.Seri
                            long_entry=close > up, long_exit=close < dn,
                            short_entry=close < dn, short_exit=close > up,
                            allow_short=allow_short)
+
+    elif t == "supertrend":
+        # направление supertrend = сторона позиции (+1 long / -1 short)
+        trend = ind.supertrend(df, genome["st_period"], genome["st_mult"])
+        sig = trend.astype(int)
+        if not allow_short:
+            sig = sig.clip(lower=0)
+
+    elif t == "macd_adx":
+        # MACD-кросс, но ТОЛЬКО при сильном тренде (ADX>=adx_min); иначе кэш
+        ml, sl = ind.macd(close)
+        strong = ind.adx(df, 14) >= genome["adx_min"]
+        up = (ml > sl) & strong
+        dn = (ml < sl) & strong
+        sig = pd.Series(np.where(up, 1, np.where(dn, -1, 0)), index=df.index)
+        if not allow_short:
+            sig = sig.clip(lower=0)
 
     else:
         raise ValueError(f"Неизвестный тип стратегии: {t}")
