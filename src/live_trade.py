@@ -138,15 +138,18 @@ def tick(conn, cfg, verbose=True):
                 minute_cache[sym] = (fallback_price, fallback_price)
         return minute_cache[sym]
 
-    # свежие данные по уникальным символам
-    symbols = {a["symbol"] for a in agents}
-    data = {}
-    for s in symbols:
+    # свежие данные по уникальным парам (символ × таймфрейм) — мультитаймфрейм
+    pairs = {(a["symbol"], a["timeframe"]) for a in agents}
+    data = {}            # (sym, tf) -> DataFrame
+    last_close = {}      # sym -> последняя цена (для mark-to-market позиций)
+    for s, tf in pairs:
         try:
-            data[s] = feed.fetch_recent(s, cfg["timeframe"], 400)
+            df = feed.fetch_recent(s, tf, 400)
+            data[(s, tf)] = df
+            last_close[s] = float(df["close"].iloc[-1])
         except Exception as e:  # noqa
             if verbose:
-                print(f"  [!] нет данных {s}: {e}")
+                print(f"  [!] нет данных {s} {tf}: {e}")
 
     allow_short = risk_cfg.get("allow_short", False)
 
@@ -154,8 +157,8 @@ def tick(conn, cfg, verbose=True):
     def equity_now():
         eq = capital
         for p in positions.values():
-            if p.symbol in data:
-                eq += p.value(float(data[p.symbol]["close"].iloc[-1]))
+            if p.symbol in last_close:
+                eq += p.value(last_close[p.symbol])
         return eq
 
     eq = equity_now()
@@ -168,11 +171,12 @@ def tick(conn, cfg, verbose=True):
 
     for a in agents:
         aid, sym = a["id"], a["symbol"]
-        if sym not in data:
-            continue
-        df = data[sym]
-        price = float(df["close"].iloc[-1])
         g = json.loads(a["genome"])
+        key = (sym, g["timeframe"])
+        if key not in data:
+            continue
+        df = data[key]
+        price = float(df["close"].iloc[-1])
         # реагируем на сигнал УЖЕ ЗАКРЫТОГО бара (не на текущий, формирующийся) —
         # не зависим от скорости доступа к бирже.
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)

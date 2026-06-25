@@ -32,20 +32,20 @@ def load_cfg(path="config.yaml"):
         return yaml.safe_load(f)
 
 
+def _timeframes(cfg):
+    return cfg.get("timeframes", [cfg["timeframe"]])
+
+
 def cmd_fetch(conn, cfg):
     print("Загрузка рыночных данных с Binance (публичный API, без ключей)...")
-    for sym in cfg["symbols"]:
-        feed.fetch_ohlcv(conn, sym, cfg["timeframe"], cfg["history_days"])
+    feed.fetch_all(conn, cfg["symbols"], _timeframes(cfg), cfg["history_days"])
 
 
 def _load_data(conn, cfg):
-    data = {}
-    for sym in cfg["symbols"]:
-        df = feed.load_ohlcv(conn, sym, cfg["timeframe"])
-        if df.empty:
-            print(f"  [!] Нет данных для {sym}. Запусти: python main.py fetch")
-        else:
-            data[sym] = df
+    """Возвращает {(symbol, timeframe): DataFrame} по всем парам (мультитаймфрейм)."""
+    data = feed.load_all(conn, cfg["symbols"], _timeframes(cfg))
+    if not data:
+        print("  [!] Нет данных. Запусти: python main.py fetch")
     return data
 
 

@@ -37,7 +37,7 @@ def _macro_blocks_entries(cfg) -> bool:
     return blocked
 
 
-def run_paper(conn, cfg, data_by_symbol):
+def run_paper(conn, cfg, data_by_key):
     promoted = db.get_agents(conn, "promoted")
     if not promoted:
         print("Нет продвинутых агентов. Запусти эволюцию и супервизора.")
@@ -57,9 +57,10 @@ def run_paper(conn, cfg, data_by_symbol):
     streams = []
     for a in promoted:
         sym = a["symbol"]
-        if sym not in data_by_symbol:
+        key = (sym, a["timeframe"])
+        if key not in data_by_key:
             continue
-        _, test_df = bt.split_train_test(data_by_symbol[sym], cfg["train_ratio"])
+        _, test_df = bt.split_train_test(data_by_key[key], cfg["train_ratio"])
         g = json.loads(a["genome"])
         delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
         sig = gn.signal(g, test_df, allow_short).shift(delay).fillna(0).astype(int)

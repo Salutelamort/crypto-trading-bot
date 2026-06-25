@@ -66,10 +66,9 @@ def main():
     deadline = time.time() + budget_min * 60
 
     print(f"== Автообучение (пачка, бюджет {budget_min} мин) ==")
-    for sym in cfg["symbols"]:
-        feed.fetch_ohlcv(conn, sym, cfg["timeframe"], cfg["history_days"])
-    data = {s: feed.load_ohlcv(conn, s, cfg["timeframe"]) for s in cfg["symbols"]}
-    data = {s: d for s, d in data.items() if not d.empty}
+    timeframes = cfg.get("timeframes", [cfg["timeframe"]])
+    feed.fetch_all(conn, cfg["symbols"], timeframes, cfg["history_days"])
+    data = feed.load_all(conn, cfg["symbols"], timeframes)   # ключ (symbol, timeframe)
 
     # Цикл: эволюция накапливает и улучшает популяцию (рождение/смерть внутри неё).
     cycles = 0
@@ -85,6 +84,13 @@ def main():
     live_trade.tick(conn, cfg)
     _journal(conn, cfg)
     print(f"\nГотово: циклов эволюции за прогон — {cycles}")
+
+    # Свечи (мультитаймфрейм ~170k строк) НЕ храним в коммите: следующий прогон
+    # всё равно перекачивает их заново. Чистим перед сохранением, чтобы bot.db
+    # в репозитории оставался лёгким (память обучения = агенты/решения/сделки).
+    conn.execute("DELETE FROM candles")
+    conn.commit()
+    conn.execute("VACUUM")
     conn.close()
 
 

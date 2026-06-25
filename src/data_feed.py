@@ -15,8 +15,9 @@ BINANCE_BASE = "https://api.binance.com"
 BINANCE_FALLBACKS = ["https://data-api.binance.vision", "https://api.binance.com"]
 
 _TF_MS = {
-    "1m": 60_000, "5m": 300_000, "15m": 900_000,
-    "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
 }
 
 
@@ -71,6 +72,24 @@ def fetch_ohlcv(conn, symbol: str, timeframe: str, days: int) -> pd.DataFrame:
         conn.commit()
     print(f"  [{symbol} {timeframe}] сохранено свечей: {len(rows)}")
     return load_ohlcv(conn, symbol, timeframe)
+
+
+def fetch_all(conn, symbols, timeframes, days: int):
+    """Качает историю по всем парам (символ × таймфрейм) для мультитаймфрейма."""
+    for sym in symbols:
+        for tf in timeframes:
+            fetch_ohlcv(conn, sym, tf, days)
+
+
+def load_all(conn, symbols, timeframes) -> dict:
+    """Загружает кэш по всем парам. Ключ словаря — кортеж (symbol, timeframe)."""
+    data = {}
+    for sym in symbols:
+        for tf in timeframes:
+            df = load_ohlcv(conn, sym, tf)
+            if not df.empty:
+                data[(sym, tf)] = df
+    return data
 
 
 def load_ohlcv(conn, symbol: str, timeframe: str) -> pd.DataFrame:

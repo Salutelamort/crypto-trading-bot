@@ -87,7 +87,7 @@ def _oos_returns(genome, df, cfg):
     return m["equity"].pct_change().fillna(0.0)
 
 
-def _anti_clone(conn, cfg, data_by_symbol):
+def _anti_clone(conn, cfg, data_by_key):
     """
     ДИВЕРСИФИКАЦИЯ. Убиваем клонов по РЕАЛЬНОЙ корреляции кривых дохода
     (а не по близости Sharpe, как раньше — то пропускало однотипных).
@@ -100,28 +100,39 @@ def _anti_clone(conn, cfg, data_by_symbol):
     """
     thresh = cfg["evolution"]["anti_clone_corr"]
     alive = db.get_agents(conn, "candidate")
-    rets = {}
+    info = {}   # id -> (timeframe, returns series)
     for a in alive:
-        sym = a["symbol"]
-        if sym not in data_by_symbol:
+        key = (a["symbol"], a["timeframe"])
+        if key not in data_by_key:
             continue
         try:
-            rets[a["id"]] = _oos_returns(json.loads(a["genome"]), data_by_symbol[sym], cfg)
+            info[a["id"]] = (a["timeframe"],
+                             _oos_returns(json.loads(a["genome"]), data_by_key[key], cfg))
         except Exception:  # noqa
             continue
-    if len(rets) < 2:
+    if len(info) < 2:
         return 0
 
-    R = pd.DataFrame(rets).fillna(0.0)
-    corr = R.corr()
     score = {a["id"]: ((a["test_alpha"] if a["test_alpha"] is not None else -99),
                        (a["test_sharpe"] if a["test_sharpe"] is not None else -99))
              for a in alive}
-    # от сильнейших к слабым: сильный занимает «нишу», похожие на него — убиваются
-    order = sorted(rets.keys(), key=lambda i: score[i], reverse=True)
+    # от сильнейших к слабым: сильный занимает «нишу», похожие на него — убиваются.
+    # Корреляцию считаем ТОЛЬКО внутри одного таймфрейма (у разных ТФ разная сетка
+    # баров — это уже диверсификация по построению).
+    order = sorted(info.keys(), key=lambda i: score[i], reverse=True)
     kept, killed = [], 0
     for i in order:
-        if any(abs(corr.loc[i, j]) > thresh for j in kept):
+        tf_i, r_i = info[i]
+        clone = False
+        for j in kept:
+            tf_j, r_j = info[j]
+            if tf_i != tf_j:
+                continue
+            c = r_i.corr(r_j)
+            if pd.notna(c) and abs(c) > thresh:
+                clone = True
+                break
+        if clone:
             db.set_agent_status(conn, i, "killed")
             db.log_decision(conn, i, "kill", "rules",
                             f"анти-клон: корреляция дохода > {thresh} с более сильным агентом "
@@ -132,9 +143,10 @@ def _anti_clone(conn, cfg, data_by_symbol):
     return killed
 
 
-def evolve(conn, cfg, data_by_symbol):
+def evolve(conn, cfg, data_by_key):
     """
-    data_by_symbol: {symbol: DataFrame OHLCV}
+    data_by_key: {(symbol, timeframe): DataFrame OHLCV}
+    МУЛЬТИТАЙМФРЕЙМ: таймфрейм — часть генома, эволюция ищет лучший под стратегию.
     Запускает несколько поколений эволюции.
     """
     # РАНЬШЕ здесь был фиксированный seed(42): каждый облачный прогон генерировал
@@ -144,10 +156,11 @@ def evolve(conn, cfg, data_by_symbol):
     rng = random.Random()
     ev = cfg["evolution"]
     quarantined = db.quarantined_symbols(conn)
-    symbols = [s for s in cfg["symbols"]
-               if s in data_by_symbol and s not in quarantined]
-    if not symbols:
-        print("Нет доступных символов (все в карантине или нет данных).")
+    # доступные пары (символ, таймфрейм): есть данные и символ не в карантине
+    keys = [(s, tf) for (s, tf) in data_by_key
+            if s in cfg["symbols"] and s not in quarantined]
+    if not keys:
+        print("Нет доступных пар символ/таймфрейм (карантин или нет данных).")
         return
 
     for gen in range(ev["generations"]):
@@ -161,33 +174,27 @@ def evolve(conn, cfg, data_by_symbol):
         ranked_alive = sorted(alive, key=lambda a: _fitness(a, min_tr), reverse=True)
         survivors = _select_survivors(ranked_alive, ev["survivors"], max_per_sym)
 
-        # Генерируем новых ТОЛЬКО на символах с доказанным преимуществом
-        # (как piratastuertos). Пока таких нет — по всем (фаза bootstrap).
-        gen_symbols = symbols
-        if ev.get("restrict_to_proven"):
-            gen_symbols = _proven_symbols(conn, cfg, symbols)
-
         new_genomes = []
-        # мутации выживших (символ сохраняется)
+        # мутации выживших (символ И таймфрейм сохраняются)
         for s in survivors:
             for _ in range(ev["mutations_per_survivor"]):
                 new_genomes.append(gn.mutate(json.loads(s["genome"]), rng))
-        # добиваем случайными на проверенных символах
+        # добиваем случайными по всем парам (символ × таймфрейм)
         while len(new_genomes) < need:
-            sym = rng.choice(gen_symbols)
-            new_genomes.append(gn.random_genome(sym, cfg["timeframe"], rng))
+            sym, tf = rng.choice(keys)
+            new_genomes.append(gn.random_genome(sym, tf, rng))
         new_genomes = new_genomes[:max(need, 0)]
 
         # 2. Оцениваем новых кандидатов через walk-forward.
         for g in new_genomes:
-            sym = g["symbol"]
-            if sym not in data_by_symbol:
+            key = (g["symbol"], g["timeframe"])
+            if key not in data_by_key:
                 continue
-            df = data_by_symbol[sym]
+            df = data_by_key[key]
             if len(df) < 400:
                 continue
             train_m, test_m, cons = _evaluate(g, df, cfg)
-            aid = db.insert_agent(conn, g, sym, cfg["timeframe"])
+            aid = db.insert_agent(conn, g, g["symbol"], g["timeframe"])
             db.update_agent_metrics(conn, aid, train_m, test_m, cons)
 
         # 3. Отбор: выживают лучшие С КВОТОЙ на символ (диверсификация генофонда).
@@ -205,13 +212,13 @@ def evolve(conn, cfg, data_by_symbol):
                             f"эволюционный отбор: {reason}")
 
         # 4. Анти-клон фильтр (по реальной корреляции дохода → диверсификация).
-        cloned = _anti_clone(conn, cfg, data_by_symbol)
+        cloned = _anti_clone(conn, cfg, data_by_key)
 
         survivors_now = db.get_agents(conn, "candidate")
         print(f"  Живых агентов: {len(survivors_now)} | убито клонов: {cloned}")
         for a in sorted(survivors_now,
                         key=lambda x: x["test_sharpe"] or -99, reverse=True)[:5]:
             g = json.loads(a["genome"])
-            print(f"   #{a['id']} {g['type']:14s} {a['symbol']:8s} "
+            print(f"   #{a['id']} {g['type']:14s} {a['symbol']:8s} {a['timeframe']:>3s} "
                   f"train_sh={a['train_sharpe']:.2f} test_sh={a['test_sharpe']:.2f} "
                   f"cons={a['consistency']:.2f} trades={a['test_trades']}")
