@@ -18,6 +18,7 @@
 """
 import json
 from . import db
+from . import metrics as mt
 
 
 def _agent_summary(a: dict) -> dict:
@@ -30,9 +31,12 @@ def _agent_summary(a: dict) -> dict:
     }
 
 
-def _decide(agents, cfg, quarantined):
-    """Детерминированные правила выживания/допуска. Никакого LLM."""
+def _decide(agents, cfg, quarantined, sr0=0.0):
+    """Детерминированные правила выживания/допуска. Никакого LLM.
+    sr0 — планка Deflated Sharpe: Sharpe ниже неё считаем возможной случайностью."""
     sup = cfg["supervisor"]
+    # планка sharpe-пути с поправкой на число испытаний (защита от самообмана)
+    sharpe_bar = max(sup["promote_min_sharpe"], sr0)
     decisions = []
     for a in agents:
         s = _agent_summary(a)
@@ -58,7 +62,7 @@ def _decide(agents, cfg, quarantined):
                    and a["symbol"] not in quarantined)
         # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha),
         # ЛИБО высокого Calmar (доход на единицу просадки — профиль низкого риска).
-        edge_ok = (ts >= sup["promote_min_sharpe"]
+        edge_ok = (ts >= sharpe_bar
                    or alpha >= sup.get("promote_min_alpha", 99)
                    or calmar >= sup.get("promote_min_calmar", 99))
         if base_ok and edge_ok:
@@ -80,8 +84,19 @@ def supervise(conn, cfg):
         print("Нет агентов-кандидатов. Сначала запусти эволюцию.")
         return {"kill": 0, "promote": 0, "hold": 0}
 
+    # Deflated Sharpe: планка "лучшего по удаче" из РАСПРЕДЕЛЕНИЯ Sharpe всех испытаний
+    # (всех когда-либо оценённых агентов), чтобы не поверить везунчику среди тысяч.
+    sr0 = 0.0
+    if cfg["supervisor"].get("deflated_sharpe_enabled", True):
+        rows = conn.execute(
+            "SELECT test_sharpe FROM agents WHERE test_sharpe IS NOT NULL").fetchall()
+        sr0 = mt.expected_max_sharpe([r["test_sharpe"] for r in rows])
+        print(f"  Deflated Sharpe: планка случайности SR0={sr0:.2f} "
+              f"(по {len(rows)} испытаниям) → sharpe-путь требует Sharpe >= "
+              f"max({cfg['supervisor']['promote_min_sharpe']}, {sr0:.2f})")
+
     print(f"\nОтбор эволюции оценивает {len(agents)} агентов (правила, без LLM)...")
-    decisions = _decide(agents, cfg, quarantined)
+    decisions = _decide(agents, cfg, quarantined, sr0)
 
     # --- ДИВЕРСИФИКАЦИЯ на уровне допуска ---
     # Даже после анти-клона ограничиваем концентрацию: не больше N стратегий на

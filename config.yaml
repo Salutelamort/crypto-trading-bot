@@ -35,6 +35,8 @@ train_ratio: 0.50          # первая половина данных — in-s
 test_ratio: 0.50           # вторая половина — out-of-sample, делится на окна ниже
 validation:
   walk_forward_windows: 4  # на сколько окон режем out-of-sample (устойчивость во времени)
+  embargo_bars: 20         # ЗАЗОР между train и test (López de Prado, purged CV):
+                           # индикаторы на границе не подсматривают данные обучения
 
 # --- Эволюция (генерация/отбор/убийство агентов) ---
 evolution:
@@ -104,6 +106,9 @@ supervisor:
   promote_min_sharpe: 0.5          # достижимый порог качества кривой
   promote_min_alpha: 0.05          # ИЛИ обгон "купи и держи" на >=5% за OOS-окна
   promote_min_calmar: 0.5          # ИЛИ Calmar >=0.5 (доход на единицу макс. просадки)
+  deflated_sharpe_enabled: true    # поправка на число испытаний (López de Prado):
+                                   # планка sharpe-пути = max(promote_min_sharpe, SR0),
+                                   # где SR0 — лучший Sharpe, достижимый по чистой удаче
   promote_min_trades: 20           # минимум сделок (статзначимость)
   promote_min_consistency: 0.6     # доля окон, где обогнали рынок (alpha>0), >= 60%
   promote_max_drawdown: 0.12       # просадка не выше 12% (профиль низкого риска)

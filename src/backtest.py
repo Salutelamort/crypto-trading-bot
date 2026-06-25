@@ -197,8 +197,12 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     full_sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int)
 
     cut = int(len(df) * cfg["train_ratio"])
+    # EMBARGO (López de Prado, purged CV): зазор между train и test, чтобы индикаторы
+    # на границе не "подсматривали" данные обучения (утечка). Пропускаем N баров.
+    embargo = int(cfg.get("validation", {}).get("embargo_bars", 0))
+    oos_start = min(cut + embargo, len(df))
     train_df = df.iloc[:cut]
-    oos_df = df.iloc[cut:]
+    oos_df = df.iloc[oos_start:]
 
     train_m = run(genome, train_df, cfg, sig=full_sig.iloc[:cut])
 
@@ -210,11 +214,11 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     for w in windows:
         a, b = int(w[0]), int(w[-1]) + 1
         seg = oos_df.iloc[a:b]
-        seg_sig = full_sig.iloc[cut + a:cut + b]
+        seg_sig = full_sig.iloc[oos_start + a:oos_start + b]
         results.append(run(genome, seg, cfg, sig=seg_sig))
 
     if not results:  # данных мало — откат на единый OOS
-        test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[cut:])
+        test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[oos_start:])
         return train_m, test_m, 0.0
 
     total_trades = sum(r["num_trades"] for r in results)

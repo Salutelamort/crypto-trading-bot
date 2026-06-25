@@ -6,8 +6,36 @@
 метрику можно. Подделать две независимые метрики одновременно намного сложнее."
 + метрика consistency (backtest winrate vs реальный winrate) ловит переобучение.
 """
+import math
+import statistics
+from statistics import NormalDist
 import numpy as np
 import pandas as pd
+
+
+def expected_max_sharpe(trial_sharpes) -> float:
+    """
+    DEFLATED SHARPE (Bailey & López de Prado): ожидаемый МАКСИМАЛЬНЫЙ Sharpe, который
+    можно получить ЧИСТО ПО УДАЧЕ, перебрав T стратегий с разбросом их Sharpe.
+
+    Идея: перебрав тысячи вариантов, почти наверняка найдёшь "везучий" с высоким
+    Sharpe. Эта функция оценивает планку, которую надо ПРЕВЗОЙТИ, чтобы поверить в
+    реальное преимущество (а не случайность от количества попыток).
+
+    SR0 = sigma_SR * ((1-γ)·Z(1-1/T) + γ·Z(1-1/(T·e))), γ = Эйлер-Маскерони.
+    """
+    vals = [s for s in trial_sharpes if s is not None and -90 < s < 90]
+    T = len(vals)
+    if T < 2:
+        return 0.0
+    sigma = statistics.stdev(vals)
+    if sigma <= 0:
+        return 0.0
+    gamma = 0.5772156649015329
+    nd = NormalDist()
+    z1 = nd.inv_cdf(1 - 1.0 / T)
+    z2 = nd.inv_cdf(1 - 1.0 / (T * math.e))
+    return float(sigma * ((1 - gamma) * z1 + gamma * z2))
 
 # Кол-во периодов в году для годового Sharpe (зависит от таймфрейма).
 PERIODS_PER_YEAR = {
