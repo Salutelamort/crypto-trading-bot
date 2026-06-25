@@ -86,6 +86,9 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     close = df["close"].values
     high = df["high"].values
     low = df["low"].values
+    # ОПТИМИЗАЦИЯ: работаем с numpy-массивами в цикле. sig.iloc[i] (доступ pandas
+    # по элементу) был главным тормозом — переходим на sig_arr[i]. Логика та же.
+    sig_arr = sig.to_numpy()
     n = len(df)
     atr_arr = ind.atr(df, risk.get("atr_period", 14)).values if risk.get("atr_stop") else [None] * n
 
@@ -116,7 +119,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
 
     for i in range(n):
         price = close[i]
-        s = int(sig.iloc[i])
+        s = int(sig_arr[i])
 
         # --- управление открытой позицией: риск приоритетнее сигнала ---
         if in_pos:
