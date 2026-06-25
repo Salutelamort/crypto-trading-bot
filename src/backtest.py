@@ -216,12 +216,16 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
 
     # Агент, который НЕ торгует в out-of-sample, бесполезен → худший балл, не 0.0.
     if total_trades == 0 or not traded:
-        test_m = {"sharpe": -99.0, "total_return": 0.0, "win_rate": 0.0,
+        test_m = {"sharpe": -99.0, "sortino": -99.0, "calmar": -99.0,
+                  "profit_factor": 0.0, "total_return": 0.0, "win_rate": 0.0,
                   "num_trades": 0, "max_drawdown": 0.0, "buy_hold": 0.0, "alpha": 0.0}
         return train_m, test_m, 0.0
 
     test_m = {
         "sharpe": round(float(np.mean([r["sharpe"] for r in traded])), 3),
+        "sortino": round(float(np.mean([r["sortino"] for r in traded])), 3),
+        "calmar": round(float(np.mean([r["calmar"] for r in traded])), 3),
+        "profit_factor": round(float(np.mean([r["profit_factor"] for r in traded])), 3),
         "total_return": round(float(np.mean([r["total_return"] for r in traded])), 4),
         "win_rate": round(float(np.mean([r["win_rate"] for r in traded])), 3),
         "num_trades": int(total_trades),

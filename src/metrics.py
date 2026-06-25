@@ -37,6 +37,14 @@ def compute_metrics(equity: pd.Series, returns: pd.Series,
     else:
         sharpe = 0.0
 
+    # SORTINO: как Sharpe, но в знаменателе только просадочная (downside) волатильность.
+    # Рост вверх не штрафуется — честнее для нашей цели (важны именно убытки).
+    downside = r[r < 0]
+    if len(downside) and np.sqrt(np.mean(downside ** 2)) > 0:
+        sortino = float(np.sqrt(ann) * r.mean() / np.sqrt(np.mean(downside ** 2)))
+    else:
+        sortino = 0.0
+
     total_return = float(equity.iloc[-1] / equity.iloc[0] - 1) if len(equity) else 0.0
 
     # Максимальная просадка
@@ -47,11 +55,32 @@ def compute_metrics(equity: pd.Series, returns: pd.Series,
     else:
         max_drawdown = 0.0
 
+    # CALMAR: годовая доходность / макс. просадка. Прямо про профиль "низкий риск":
+    # сколько доходности на единицу самой глубокой ямы.
+    n = len(equity)
+    if n and equity.iloc[0] > 0:
+        cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (ann / n) - 1)
+    else:
+        cagr = 0.0
+    calmar = float(cagr / max_drawdown) if max_drawdown > 1e-9 else 0.0
+
     wins = [p for p in trade_results if p > 0]
+    losses = [p for p in trade_results if p < 0]
     win_rate = float(len(wins) / len(trade_results)) if trade_results else 0.0
+
+    # PROFIT FACTOR: сумма прибылей / сумма убытков. >1 = стратегия прибыльна.
+    gross_win = float(sum(wins))
+    gross_loss = float(abs(sum(losses)))
+    if gross_loss > 1e-12:
+        profit_factor = round(gross_win / gross_loss, 3)
+    else:
+        profit_factor = 10.0 if gross_win > 0 else 0.0  # нет убытков → кап 10.0
 
     return {
         "sharpe": round(sharpe, 3),
+        "sortino": round(sortino, 3),
+        "calmar": round(calmar, 3),
+        "profit_factor": profit_factor,
         "total_return": round(total_return, 4),
         "max_drawdown": round(max_drawdown, 4),
         "win_rate": round(win_rate, 3),

@@ -41,6 +41,8 @@ def _decide(agents, cfg, quarantined):
         cons = s["consistency"] or 0.0
         trades = s["test_trades"] or 0
         alpha = a["test_alpha"] if a["test_alpha"] is not None else -99
+        calmar = a["test_calmar"] if a["test_calmar"] is not None else -99
+        pf = a["test_pf"] if a["test_pf"] is not None else 0
 
         # СМЕРТЬ агентов происходит ВНУТРИ эволюции (отбор по приспособленности
         # в evolution.py). Здесь супервизор НЕ убивает — только ДОПУСКАЕТ к живой
@@ -54,16 +56,18 @@ def _decide(agents, cfg, quarantined):
                    and cons >= sup["promote_min_consistency"]
                    and dd <= sup.get("promote_max_drawdown", 1.0)
                    and a["symbol"] not in quarantined)
-        # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha).
+        # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha),
+        # ЛИБО высокого Calmar (доход на единицу просадки — профиль низкого риска).
         edge_ok = (ts >= sup["promote_min_sharpe"]
-                   or alpha >= sup.get("promote_min_alpha", 99))
+                   or alpha >= sup.get("promote_min_alpha", 99)
+                   or calmar >= sup.get("promote_min_calmar", 99))
         if base_ok and edge_ok:
             decisions.append((a["id"], "promote",
-                f"OOS Sharpe {ts:.2f}, alpha {alpha:+.1%} vs рынок, просадка {dd:.0%}, "
-                f"сделок {trades}, устойчивость {cons:.0%} окон — допущен"))
+                f"OOS Sharpe {ts:.2f}, Calmar {calmar:.2f}, PF {pf:.2f}, alpha {alpha:+.1%}, "
+                f"просадка {dd:.0%}, сделок {trades}, устойчивость {cons:.0%} — допущен"))
         else:
             decisions.append((a["id"], "hold",
-                f"не дотягивает (OOS Sharpe {ts:.2f}, alpha {alpha:+.1%}, "
+                f"не дотягивает (Sharpe {ts:.2f}, Calmar {calmar:.2f}, alpha {alpha:+.1%}, "
                 f"просадка {dd:.0%}, trades {trades}, устойчивость {cons:.0%})"))
     return decisions
 
