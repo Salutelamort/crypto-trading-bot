@@ -53,16 +53,20 @@ def _load_positions(conn):
         p = rk.Position(r["agent_id"], r["symbol"], r["entry_price"], r["units"],
                         direction=direction, notional=notional, atr=atr)
         p.peak_price = r["peak_price"]
+        p.opened_at = r["opened_at"] if "opened_at" in keys else None
         pos[r["agent_id"]] = p
     return pos
 
 
 def _save_position(conn, p):
+    # opened_at сохраняем РАЗ (при открытии), при последующих сохранениях не
+    # затираем — иначе «возраст позиции» врёт и любая логика по времени ломается.
+    opened = getattr(p, "opened_at", None) or now_iso()
     conn.execute(
         "INSERT OR REPLACE INTO live_positions "
         "(agent_id,symbol,entry_price,units,peak_price,opened_at,direction,notional,atr) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
-        (p.agent_id, p.symbol, p.entry_price, p.units, p.peak_price, now_iso(),
+        (p.agent_id, p.symbol, p.entry_price, p.units, p.peak_price, opened,
          p.direction, p.notional, p.atr))
     conn.commit()
 
@@ -162,6 +166,34 @@ def tick(conn, cfg, verbose=True):
                 print(f"  [!] нет данных {s} {tf}: {e}")
 
     allow_short = risk_cfg.get("allow_short", False)
+    actions = []
+
+    # РАСШИВКА КОНЦЕНТРАЦИИ: входной гейт не пускает новые дубли по символу, но
+    # уже открытые (легаси / занесённые иначе) ничем не вычищаются и зря держат
+    # слоты max_open_positions. На каждом тике приводим состояние к инварианту
+    # max_positions_per_symbol: лишние позиции по символу закрываем по рынку,
+    # оставляя агента с лучшим OOS Sharpe.
+    sym_limit = risk_cfg.get("max_positions_per_symbol", 99)
+    sharpe_by_id = {a["id"]: (a["test_sharpe"] if a["test_sharpe"] is not None else -99)
+                    for a in agents}
+    by_symbol = {}
+    for aid, p in positions.items():
+        by_symbol.setdefault(p.symbol, []).append(aid)
+    for sym, aids in by_symbol.items():
+        if len(aids) <= sym_limit or sym not in last_close:
+            continue
+        ranked = sorted(aids, key=lambda i: sharpe_by_id.get(i, -99), reverse=True)
+        for aid in ranked[sym_limit:]:               # всё сверх лимита — закрыть
+            pos = positions[aid]
+            fill = last_close[sym] * (1 - slip * pos.direction)
+            pnl = rk.close_pnl(pos, fill, fee)
+            capital += pos.notional + pnl
+            side = "SELL" if pos.direction == 1 else "COVER"
+            db.log_paper_trade(conn, aid, sym, side, fill, pos.units,
+                               pos.units * fill * fee, round(pnl, 2), "deconcentrate")
+            _del_position(conn, aid)
+            del positions[aid]
+            actions.append(f"{side} #{aid} {sym} @ {fill:.2f} (расшивка дубля) PnL {pnl:+.2f}")
 
     # текущий капитал и просадка (mark-to-market, работает для long и short)
     def equity_now():
@@ -177,7 +209,6 @@ def tick(conn, cfg, verbose=True):
     dd_halt = dd > dd_limit
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    actions = []
 
     for a in agents:
         aid, sym = a["id"], a["symbol"]
@@ -235,6 +266,7 @@ def tick(conn, cfg, verbose=True):
                                 notional=invest, atr=atr_val,
                                 stop_mult=g.get("stop_atr"), take_mult=take_mult,
                                 trail_mult=g.get("trail_atr"))
+                p.opened_at = now_iso()
                 positions[aid] = p
                 _save_position(conn, p)
                 side = "BUY" if sig == 1 else "SHORT"
