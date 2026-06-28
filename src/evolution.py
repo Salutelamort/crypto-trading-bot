@@ -70,9 +70,8 @@ def _proven_symbols(conn, cfg, symbols):
     """Символы с ДОКАЗАННЫМ преимуществом (как у piratastuertos): где хоть один
     агент показал OOS Sharpe выше порога. Пока таких нет — возвращаем все (bootstrap)."""
     bar = cfg["evolution"].get("proven_min_sharpe", 0.0)
-    rows = conn.execute(
-        "SELECT DISTINCT symbol FROM agents WHERE test_sharpe > ?", (bar,)).fetchall()
-    proven = {r["symbol"] for r in rows} & set(symbols)
+    # из компактной памяти (agent_stats), а не из сырых agents — переживает прунинг
+    proven = db.proven_symbols_from_stats(conn, bar) & set(symbols)
     return sorted(proven) if proven else symbols
 
 

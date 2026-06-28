@@ -32,7 +32,7 @@ def _journal(conn, cfg):
     capital, equity, npos = live_trade.account_equity(conn, cfg)
     cand = len(db.get_agents(conn, "candidate"))
     prom = len(db.get_agents(conn, "promoted"))
-    best = conn.execute("SELECT MAX(test_sharpe) m FROM agents").fetchone()["m"]
+    best = db.best_sharpe_ever(conn)   # из agent_stats — переживает прунинг истории
     try:
         bias = macro_feed.etf_flow_bias(cfg.get("macro", {}).get("asset", "BTC"))["bias"]
     except Exception:  # noqa
@@ -85,11 +85,15 @@ def main():
     _journal(conn, cfg)
     print(f"\nГотово: циклов эволюции за прогон — {cycles}")
 
-    # Свечи (мультитаймфрейм ~170k строк) НЕ храним в коммите: следующий прогон
-    # всё равно перекачивает их заново. Чистим перед сохранением, чтобы bot.db
-    # в репозитории оставался лёгким (память обучения = агенты/решения/сделки).
+    # RETENTION — держим bot.db лёгким (лимит GitHub на файл = 100 МБ):
+    #  - свечи не храним: следующий прогон перекачивает их заново;
+    #  - мёртвых агентов и старые решения старше 7 дней сворачиваем в agent_stats
+    #    (компактная память об испытаниях) и удаляем сырьё.
+    # Память «что работает / что нет» при этом НЕ теряется — она в agent_stats.
     conn.execute("DELETE FROM candles")
     conn.commit()
+    da, dd = db.prune_history(conn, keep_killed=3000, keep_decisions=8000)
+    print(f"Retention: убрано killed-агентов {da}, старых решений {dd}")
     conn.execute("VACUUM")
     conn.close()
 

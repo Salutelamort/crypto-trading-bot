@@ -88,11 +88,11 @@ def supervise(conn, cfg):
     # (всех когда-либо оценённых агентов), чтобы не поверить везунчику среди тысяч.
     sr0 = 0.0
     if cfg["supervisor"].get("deflated_sharpe_enabled", True):
-        rows = conn.execute(
-            "SELECT test_sharpe FROM agents WHERE test_sharpe IS NOT NULL").fetchall()
-        sr0 = mt.expected_max_sharpe([r["test_sharpe"] for r in rows])
+        # из компактной сводки (T, sigma по всем испытаниям) — переживает прунинг
+        n_trials, sigma = db.trial_global_stats(conn)
+        sr0 = mt.expected_max_sharpe_from_stats(n_trials, sigma)
         print(f"  Deflated Sharpe: планка случайности SR0={sr0:.2f} "
-              f"(по {len(rows)} испытаниям) → sharpe-путь требует Sharpe >= "
+              f"(по {n_trials} испытаниям) → sharpe-путь требует Sharpe >= "
               f"max({cfg['supervisor']['promote_min_sharpe']}, {sr0:.2f})")
 
     print(f"\nОтбор эволюции оценивает {len(agents)} агентов (правила, без LLM)...")

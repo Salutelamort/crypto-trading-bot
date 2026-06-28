@@ -31,6 +31,15 @@ def expected_max_sharpe(trial_sharpes) -> float:
     sigma = statistics.stdev(vals)
     if sigma <= 0:
         return 0.0
+    return expected_max_sharpe_from_stats(T, sigma)
+
+
+def expected_max_sharpe_from_stats(T: int, sigma: float) -> float:
+    """То же, что expected_max_sharpe, но из готовой сводки (число испытаний T и
+    разброс Sharpe sigma). Нужно, когда сырые испытания свёрнуты в agent_stats и
+    список Sharpe-ов уже не хранится поштучно."""
+    if T < 2 or sigma <= 0:
+        return 0.0
     gamma = 0.5772156649015329
     nd = NormalDist()
     z1 = nd.inv_cdf(1 - 1.0 / T)
