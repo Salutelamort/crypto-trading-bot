@@ -71,15 +71,18 @@ def main():
     data = feed.load_all(conn, cfg["symbols"], timeframes)   # ключ (symbol, timeframe)
 
     # Цикл: эволюция накапливает и улучшает популяцию (рождение/смерть внутри неё).
+    # Журнал пишем НЕ каждый цикл (это плодило десятки почти одинаковых строк за
+    # прогон), а один раз в конце прогона — после тика.
     cycles = 0
     while True:
         evolution.evolve(conn, cfg, data)
-        _journal(conn, cfg)
         cycles += 1
         if time.time() >= deadline:
             break
 
-    # Допуск к живой торговле (без убийства) + один тик бумажной торговли.
+    # Гигиена пула: освежить OOS-метрики допущенных (иначе они замирают на
+    # момент допуска), затем отбор с демоцией + один тик бумажной торговли.
+    evolution.reevaluate_promoted(conn, cfg, data)
     supervisor.supervise(conn, cfg)
     live_trade.tick(conn, cfg)
     _journal(conn, cfg)

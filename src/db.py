@@ -154,7 +154,8 @@ def insert_agent(conn, genome: dict, symbol: str, timeframe: str) -> int:
     return cur.lastrowid
 
 
-def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consistency: float):
+def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consistency: float,
+                         count_trial: bool = True):
     conn.execute(
         """UPDATE agents SET
             train_sharpe=?, train_return=?, train_winrate=?, train_trades=?,
@@ -169,9 +170,11 @@ def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consisten
          consistency, agent_id),
     )
     # Сворачиваем испытание в компактную память (один агент = одно испытание).
+    # count_trial=False — при ПЕРЕОЦЕНКЕ уже существующего агента (не новое
+    # испытание, счётчик Deflated Sharpe раздувать нельзя).
     row = conn.execute("SELECT genome, symbol, timeframe FROM agents WHERE id=?",
                        (agent_id,)).fetchone()
-    if row is not None:
+    if row is not None and count_trial:
         try:
             stype = json.loads(row["genome"]).get("type", "?")
         except (ValueError, TypeError):

@@ -43,6 +43,30 @@ def _evaluate(genome, df, cfg):
     return bt.walk_forward_eval(genome, df, cfg)
 
 
+def reevaluate_promoted(conn, cfg, data_by_key):
+    """ГИГИЕНА ПУЛА, шаг 1: освежить OOS-метрики допущенных агентов на свежих
+    данных (walk-forward, та же оценка, что при рождении). Без этого метрики
+    promoted замирают на момент допуска, и протухший агент живёт вечно.
+    count_trial=False: переоценка — не новое испытание для Deflated Sharpe.
+    Лимит на прогон защищает бюджет времени облака."""
+    limit = int(cfg["supervisor"].get("pool_reeval_per_run", 60))
+    promoted = db.get_agents(conn, "promoted")[:limit]
+    done = 0
+    for a in promoted:
+        g = json.loads(a["genome"])
+        key = (a["symbol"], a["timeframe"])
+        df = data_by_key.get(key)
+        if df is None or len(df) < 400:
+            continue
+        train_m, test_m, cons = _evaluate(g, df, cfg)
+        db.update_agent_metrics(conn, a["id"], train_m, test_m, cons,
+                                count_trial=False)
+        done += 1
+    if done:
+        print(f"Переоценка promoted на свежих данных: {done} агентов")
+    return done
+
+
 def _select_survivors(ranked, n, max_per_sym):
     """Выбирает n выживших с КВОТОЙ на символ, чтобы пул не схлопывался в одну
     монету (диверсификация генофонда). Если разнообразия не хватает — добивает

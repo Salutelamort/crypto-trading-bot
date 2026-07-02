@@ -76,6 +76,64 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
     return decisions
 
 
+def _pool_hygiene(conn, cfg, quarantined, sr0):
+    """ГИГИЕНА ПУЛА, шаг 2 — демоция. Без неё допущенный агент живёт вечно:
+    пул рос ~18/день (за квартал был бы ~1600, 95% в одном символе).
+
+    Правила (консервативно — пул может только СУЖАТЬСЯ, риск не растёт):
+      1. Агент, чьи ОСВЕЖЁННЫЕ метрики (reevaluate_promoted) больше не проходят
+         те же ворота допуска, — демоция.
+      2. Капы пула: не больше pool_max_per_symbol на символ и pool_max_total
+         всего (лучшие по alpha, как и при допуске).
+      3. Агентов С ОТКРЫТОЙ ПОЗИЦИЕЙ не трогаем НИКОГДА (иначе позиция
+         осиротеет — её некому будет вести к выходу).
+    Демоция = статус killed + решение 'demote' в журнале (память об испытании
+    уже в agent_stats)."""
+    sup = cfg["supervisor"]
+    promoted = db.get_agents(conn, "promoted")
+    if not promoted:
+        return 0
+    in_pos = {r["agent_id"] for r in
+              conn.execute("SELECT agent_id FROM live_positions").fetchall()}
+    demoted = 0
+
+    # 1. Переоценка теми же воротами допуска (на освежённых метриках).
+    gate = {aid: (act, why)
+            for aid, act, why in _decide(promoted, cfg, quarantined, sr0)}
+    survivors = []
+    for a in promoted:
+        act, why = gate.get(a["id"], ("hold", ""))
+        if act != "promote" and a["id"] not in in_pos:
+            db.set_agent_status(conn, a["id"], "killed")
+            db.log_decision(conn, a["id"], "demote", "evolution",
+                            f"демоция: свежая переоценка не проходит ворота ({why})")
+            demoted += 1
+        else:
+            survivors.append(a)
+
+    # 2. Капы пула (сначала агенты в позиции, потом лучшие по alpha).
+    max_per_sym = sup.get("pool_max_per_symbol", 8)
+    max_total = sup.get("pool_max_total", 30)
+    survivors.sort(key=lambda a: (a["id"] not in in_pos,
+                                  -(a["test_alpha"] if a["test_alpha"] is not None else -99)))
+    per_sym, taken = {}, 0
+    for a in survivors:
+        sym = a["symbol"]
+        over = taken >= max_total or per_sym.get(sym, 0) >= max_per_sym
+        if over and a["id"] not in in_pos:
+            db.set_agent_status(conn, a["id"], "killed")
+            db.log_decision(conn, a["id"], "demote", "evolution",
+                            f"демоция: кап пула (символ {per_sym.get(sym, 0)}/{max_per_sym}, "
+                            f"всего {taken}/{max_total})")
+            demoted += 1
+        else:
+            per_sym[sym] = per_sym.get(sym, 0) + 1
+            taken += 1
+    if demoted:
+        print(f"  Гигиена пула: демоция {demoted}, осталось допущенных {taken}")
+    return demoted
+
+
 def supervise(conn, cfg):
     """Стадия отбора эволюции: продвигает достойных, убивает слабых."""
     quarantined = db.quarantined_symbols(conn)
@@ -135,8 +193,11 @@ def supervise(conn, cfg):
         counts[action] = counts.get(action, 0) + 1
         print(f"  #{agent_id}: {action.upper():8s} — {rationale}")
 
+    counts["demote"] = _pool_hygiene(conn, cfg, quarantined, sr0)
+
     print(f"\nИтог: продвинуто {counts['promote']}, "
-          f"убито {counts['kill']}, оставлено {counts['hold']}")
+          f"убито {counts['kill']}, оставлено {counts['hold']}, "
+          f"демоция из пула {counts['demote']}")
     if counts["promote"] == 0:
         print("Ни один агент не прошёл в paper-live. Это НОРМАЛЬНО — "
               "большинство стратегий не имеют преимущества (урок из треда).")
