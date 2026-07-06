@@ -296,9 +296,12 @@ def prune_history(conn, keep_killed=3000, keep_decisions=8000):
     Живые агенты (candidate/promoted) и сделки НЕ трогаем. Память «что работает /
     что нет» сохранена в agent_stats, поэтому удаление сырых killed ничего не теряет.
     Возвращает (удалено_агентов, удалено_решений)."""
+    # Агентов, на которых ссылаются сделки, не удаляем НИКОГДА (их единицы):
+    # иначе анализ сделок по типам стратегий теряет геном (тип становится «?»).
     da = conn.execute(
         "DELETE FROM agents WHERE status='killed' AND id NOT IN "
-        "(SELECT id FROM agents WHERE status='killed' ORDER BY id DESC LIMIT ?)",
+        "(SELECT id FROM agents WHERE status='killed' ORDER BY id DESC LIMIT ?) "
+        "AND id NOT IN (SELECT DISTINCT agent_id FROM paper_trades)",
         (keep_killed,)).rowcount
     dd = conn.execute(
         "DELETE FROM decisions WHERE id NOT IN "
