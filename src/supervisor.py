@@ -112,22 +112,35 @@ def _pool_hygiene(conn, cfg, quarantined, sr0):
             survivors.append(a)
 
     # 2. Капы пула (сначала агенты в позиции, потом лучшие по alpha).
+    # Кап на КОМБО (тип×символ×ТФ) закрывает утечку клонов: анти-клон фильтр
+    # сравнивает кандидатов внутри одного прогона, а допущенные в РАЗНЫХ
+    # прогонах между собой не сравниваются — одинаковые геномы копились в пуле
+    # (наблюдалось: 6 идентичных donchian_trend/SOL/8h из 16 мест).
     max_per_sym = sup.get("pool_max_per_symbol", 8)
     max_total = sup.get("pool_max_total", 30)
+    max_per_combo = sup.get("pool_max_per_combo", 2)
     survivors.sort(key=lambda a: (a["id"] not in in_pos,
                                   -(a["test_alpha"] if a["test_alpha"] is not None else -99)))
-    per_sym, taken = {}, 0
+    per_sym, per_combo, taken = {}, {}, 0
     for a in survivors:
         sym = a["symbol"]
-        over = taken >= max_total or per_sym.get(sym, 0) >= max_per_sym
+        try:
+            stype = json.loads(a["genome"]).get("type", "?")
+        except (ValueError, TypeError):
+            stype = "?"
+        combo = (stype, sym, a["timeframe"])
+        over = (taken >= max_total or per_sym.get(sym, 0) >= max_per_sym
+                or per_combo.get(combo, 0) >= max_per_combo)
         if over and a["id"] not in in_pos:
             db.set_agent_status(conn, a["id"], "killed")
             db.log_decision(conn, a["id"], "demote", "evolution",
-                            f"демоция: кап пула (символ {per_sym.get(sym, 0)}/{max_per_sym}, "
-                            f"всего {taken}/{max_total})")
+                            f"демоция: кап пула (комбо {stype}/{sym}/{a['timeframe']} "
+                            f"{per_combo.get(combo, 0)}/{max_per_combo}, символ "
+                            f"{per_sym.get(sym, 0)}/{max_per_sym}, всего {taken}/{max_total})")
             demoted += 1
         else:
             per_sym[sym] = per_sym.get(sym, 0) + 1
+            per_combo[combo] = per_combo.get(combo, 0) + 1
             taken += 1
     if demoted:
         print(f"  Гигиена пула: демоция {demoted}, осталось допущенных {taken}")
