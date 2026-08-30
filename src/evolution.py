@@ -9,21 +9,20 @@
 - Анти-клон фильтр: корреляция equity > порога → убить более слабого
   ("у 3 лучших агентов был идентичный Sharpe — никакой реальной диверсификации").
 - Карантин символов: символы с отрицательной PnL блокируются от генерации.
-- Метрики train и test считаются ОТДЕЛЬНО (для отбора берём train,
-  для честной оценки — test, который агент не видел).
+- Метрики train и validation считаются ОТДЕЛЬНО. Validation используется
+  многократно и поэтому не называется финальным невидимым тестом.
 
 ВАЖНО: эволюция НЕ продвигает агентов в реальную торговлю. Это делает
 супервизор (supervisor.py) — отдельное управленческое решение.
 """
 import json
 import random
-import numpy as np
+
 import pandas as pd
 
+from . import backtest as bt
 from . import db
 from . import genome as gn
-from . import backtest as bt
-from . import metrics as mt
 
 
 def _fitness(agent, min_trades):
@@ -31,6 +30,12 @@ def _fitness(agent, min_trades):
     - мало сделок в обучении (одна удачная не должна давать высокий Sharpe);
     - НОЛЬ сделок в свежих данных (OOS) — стратегия мертва на актуальном рынке,
       такие не должны выживать и размножаться (это и есть 'бесполезные' агенты)."""
+    try:
+        valid, _ = gn.validate_genome(json.loads(agent["genome"]))
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        return -999.0
     if (agent["train_trades"] or 0) < min_trades:
         return -999.0
     if (agent["test_trades"] or 0) == 0:
@@ -100,7 +105,7 @@ def _proven_symbols(conn, cfg, symbols):
 
 
 def _oos_returns(genome, df, cfg):
-    """Доходности агента на out-of-sample участке (для матрицы корреляций)."""
+    """Доходности агента на validation-участке (для матрицы корреляций)."""
     cut = int(len(df) * cfg["train_ratio"])
     oos = df.iloc[cut:]
     delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
@@ -176,8 +181,8 @@ def evolve(conn, cfg, data_by_key):
     # ОДНИ И ТЕ ЖЕ случайные геномы → 16k агентов, но реального поиска не было
     # (бег на месте). Теперь seed случайный — пространство стратегий реально
     # исследуется от прогона к прогону. Выжившие накапливаются в БД (эволюция).
-    rng = random.Random()
     ev = cfg["evolution"]
+    rng = random.Random(ev.get("seed"))
     quarantined = db.quarantined_symbols(conn)
     # доступные пары (символ, таймфрейм): есть данные и символ не в карантине
     keys = [(s, tf) for (s, tf) in data_by_key

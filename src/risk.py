@@ -6,6 +6,7 @@
 Этот модуль управляет ЖИВЫМИ (бумажными) позициями: размер позиции,
 лимит одновременных позиций, расчёт цен выхода с ratcheting trailing stop.
 """
+import math
 
 
 class Position:
@@ -17,7 +18,8 @@ class Position:
     """
     def __init__(self, agent_id, symbol, entry_price, units,
                  direction=1, notional=None, atr=None,
-                 stop_mult=None, take_mult=None, trail_mult=None):
+                 stop_mult=None, take_mult=None, trail_mult=None,
+                 entry_fee_paid=False):
         self.agent_id = agent_id
         self.symbol = symbol
         self.entry_price = entry_price
@@ -29,6 +31,7 @@ class Position:
         self.stop_mult = stop_mult
         self.take_mult = take_mult
         self.trail_mult = trail_mult
+        self.entry_fee_paid = entry_fee_paid
         # экстремум в нашу пользу: пик (long) или дно (short) — для ratcheting trail
         self.peak_price = entry_price
 
@@ -68,7 +71,9 @@ class Position:
         срабатывал между тиками как настоящий резервный ордер.
         Возвращает (надо_выходить, причина, цена_выхода). Стоп приоритетнее тейка.
         """
-        self.update_extreme(high, low)
+        # Уровни считаются по экстремуму, известному ДО этой свечи. Иначе high
+        # свечи мог бы подтянуть trailing-stop, а более ранний low той же свечи —
+        # тут же его исполнить: порядок событий внутри OHLC неизвестен.
         eff_stop, take = self._levels(risk_cfg)
         if self.direction == 1:
             if low <= eff_stop:
@@ -80,6 +85,7 @@ class Position:
                 return True, "stop", eff_stop
             if low <= take:
                 return True, "take_profit", take
+        self.update_extreme(high, low)
         return False, None, price
 
     def exit_check(self, price, risk_cfg):
@@ -91,7 +97,9 @@ def close_pnl(pos: "Position", exit_fill: float, fee: float) -> float:
     """Реализованный PnL при закрытии (работает для long и short).
     exit_fill — цена выхода уже с учётом проскальзывания."""
     gross = pos.direction * pos.units * (exit_fill - pos.entry_price)
-    fees = (pos.notional + pos.units * exit_fill) * fee
+    fees = pos.units * exit_fill * fee
+    if not pos.entry_fee_paid:  # legacy-позиции: входная комиссия ещё не списана
+        fees += pos.notional * fee
     return gross - fees
 
 
@@ -111,7 +119,8 @@ def sized_fraction(risk_cfg: dict, atr=None, price=None) -> float:
     cap = risk_cfg["position_fraction"]   # потолок доли на сделку
     # atr != atr → NaN (ранние бары, где ATR ещё не посчитан) → откат на потолок
     if (not risk_cfg.get("vol_target") or atr is None or price is None
-            or atr != atr or price != price or atr <= 0 or price <= 0):
+            or not math.isfinite(atr) or not math.isfinite(price)
+            or atr <= 0 or price <= 0):
         return cap
     stop_mult = risk_cfg.get("atr_stop_mult", 2.0)
     rpt = risk_cfg.get("risk_per_trade", 0.005)

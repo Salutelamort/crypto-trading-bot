@@ -2,8 +2,7 @@
 ЖИВОЙ бумажный трейдинг в реальном времени — БЕЗ биржи и без ключей.
 
 Почему так (а не Binance Testnet): тестнет Binance геоблокирован (451) с машины
-пользователя, а VPN на разрешённую страну включить нельзя — он нужен для доступа
-к Claude. Поэтому исполнение считаем локально, а цены берём с публичного
+пользователя. Поэтому исполнение считаем локально, а цены берём с публичного
 `data-api.binance.vision`, который работает при включённом VPN.
 
 Что делает один "тик":
@@ -16,12 +15,15 @@
 Торговля 100% детерминированная. Состояние живёт в БД, поэтому можно
 останавливать/запускать бота без потери позиций.
 """
-import time
 import json
+import time
+from datetime import datetime, timedelta, timezone
 
-from . import db, data_feed as feed, genome as gn, risk as rk, macro_feed, news_feed
+from . import data_feed as feed
+from . import db, macro_feed, news_feed, protections
+from . import genome as gn
 from . import indicators as ind
-from . import protections
+from . import risk as rk
 from .db import now_iso
 
 
@@ -51,9 +53,14 @@ def _load_positions(conn):
         notional = r["notional"] if "notional" in keys and r["notional"] else r["units"] * r["entry_price"]
         atr = r["atr"] if "atr" in keys else None
         p = rk.Position(r["agent_id"], r["symbol"], r["entry_price"], r["units"],
-                        direction=direction, notional=notional, atr=atr)
+                        direction=direction, notional=notional, atr=atr,
+                        entry_fee_paid=bool(r["entry_fee_paid"]) if "entry_fee_paid" in keys else False)
         p.peak_price = r["peak_price"]
         p.opened_at = r["opened_at"] if "opened_at" in keys else None
+        p.experiment_id = r["experiment_id"] if "experiment_id" in keys else "legacy"
+        p.code_sha = r["code_sha"] if "code_sha" in keys else None
+        p.config_hash = r["config_hash"] if "config_hash" in keys else None
+        p.mark_price = r["mark_price"] if "mark_price" in keys else r["entry_price"]
         pos[r["agent_id"]] = p
     return pos
 
@@ -62,18 +69,35 @@ def _save_position(conn, p):
     # opened_at сохраняем РАЗ (при открытии), при последующих сохранениях не
     # затираем — иначе «возраст позиции» врёт и любая логика по времени ломается.
     opened = getattr(p, "opened_at", None) or now_iso()
+    provenance = db.current_provenance(conn)
+    experiment_id = getattr(p, "experiment_id", None) or provenance["experiment_id"]
+    code_sha = getattr(p, "code_sha", provenance["code_sha"])
+    config_hash = getattr(p, "config_hash", provenance["config_hash"])
+    p.experiment_id, p.code_sha, p.config_hash = experiment_id, code_sha, config_hash
     conn.execute(
         "INSERT OR REPLACE INTO live_positions "
-        "(agent_id,symbol,entry_price,units,peak_price,opened_at,direction,notional,atr) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "(agent_id,symbol,entry_price,units,peak_price,opened_at,direction,notional,atr,"
+        "experiment_id,code_sha,config_hash,last_checked_at,mark_price,entry_fee_paid) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (p.agent_id, p.symbol, p.entry_price, p.units, p.peak_price, opened,
-         p.direction, p.notional, p.atr))
+         p.direction, p.notional, p.atr, experiment_id, code_sha, config_hash,
+         now_iso(), getattr(p, "mark_price", p.entry_price), int(p.entry_fee_paid)))
     conn.commit()
 
 
 def _del_position(conn, agent_id):
     conn.execute("DELETE FROM live_positions WHERE agent_id=?", (agent_id,))
     conn.commit()
+
+
+def _position_provenance(position):
+    return {"experiment_id": getattr(position, "experiment_id", "legacy"),
+            "code_sha": getattr(position, "code_sha", None),
+            "config_hash": getattr(position, "config_hash", None)}
+
+
+def _position_mode(position):
+    return "legacy" if getattr(position, "experiment_id", "legacy") == "legacy" else "live"
 
 
 def _active_agents(conn, cfg):
@@ -92,6 +116,7 @@ def _active_agents(conn, cfg):
 
 # ---------- один тик живой торговли ----------
 def tick(conn, cfg, verbose=True):
+    db.ensure_experiment(conn, cfg)
     capital, peak = _init_account(conn, cfg)
     risk_cfg = cfg["risk"]
     fee = cfg["costs"]["fee_pct"]
@@ -107,6 +132,7 @@ def tick(conn, cfg, verbose=True):
 
     # макро-страж (farside работает при VPN)
     macro_block = False
+    macro_unavailable = False
     mc = cfg.get("macro", {})
     if mc.get("enabled"):
         try:
@@ -114,8 +140,12 @@ def tick(conn, cfg, verbose=True):
                                             mc.get("lookback_days", 5),
                                             mc.get("block_threshold_musd", 0))
             macro_block = info["bias"] == "risk_off"
+            macro_unavailable = not info.get("available", False)
+            if macro_unavailable and mc.get("fail_closed", False):
+                macro_block = True
         except Exception:  # noqa
-            pass
+            macro_unavailable = True
+            macro_block = bool(mc.get("fail_closed", False))
 
     # новостной страж (индекс страха/жадности + негативные катализаторы)
     news_block = False
@@ -139,14 +169,27 @@ def tick(conn, cfg, verbose=True):
 
     positions = _load_positions(conn)
     interval = cfg.get("live", {}).get("interval_seconds", 300)
-    n_min = max(2, int(interval / 60) + 1)  # сколько 1m-баров покрывают паузу между тиками
+    last_tick_raw = db.get_runtime_state(conn, "last_tick_at")
+    try:
+        last_tick = datetime.fromisoformat(last_tick_raw) if last_tick_raw else None
+        if last_tick and last_tick.tzinfo is None:
+            last_tick = last_tick.replace(tzinfo=timezone.utc)
+    except ValueError:
+        last_tick = None
+    if last_tick is None:
+        last_tick = datetime.now(timezone.utc) - timedelta(seconds=interval)
+    max_minutes = int(cfg.get("live", {}).get("max_catchup_minutes", 10080))
+    catchup_truncated = (datetime.now(timezone.utc) - last_tick).total_seconds() > max_minutes * 60
     minute_cache = {}
 
     def minute_hl(sym, fallback_price):
         """High/Low по 1m-свечам с прошлого тика — для внутрибарного стопа."""
         if sym not in minute_cache:
             try:
-                md = feed.fetch_recent(sym, "1m", n_min + 2).tail(n_min)
+                start_ms = int(last_tick.timestamp() * 1000) - 60_000
+                md = feed.fetch_since(sym, "1m", start_ms, max_bars=max_minutes)
+                if md.empty:
+                    raise RuntimeError("нет минутных баров")
                 minute_cache[sym] = (float(md["high"].max()), float(md["low"].min()))
             except Exception:  # noqa
                 minute_cache[sym] = (fallback_price, fallback_price)
@@ -190,7 +233,8 @@ def tick(conn, cfg, verbose=True):
             capital += pos.notional + pnl
             side = "SELL" if pos.direction == 1 else "COVER"
             db.log_paper_trade(conn, aid, sym, side, fill, pos.units,
-                               pos.units * fill * fee, round(pnl, 2), "deconcentrate")
+                               pos.units * fill * fee, round(pnl, 2), "deconcentrate",
+                               mode=_position_mode(pos), provenance=_position_provenance(pos))
             _del_position(conn, aid)
             del positions[aid]
             actions.append(f"{side} #{aid} {sym} @ {fill:.2f} (расшивка дубля) PnL {pnl:+.2f}")
@@ -228,6 +272,7 @@ def tick(conn, cfg, verbose=True):
 
         # 1. управление позицией — внутрибарно по 1m свечам (стоп как реальный ордер)
         if pos is not None:
+            pos.mark_price = price
             hi, lo = minute_hl(sym, price)
             should_exit, reason, exit_price = pos.exit_check_hl(hi, lo, price, risk_cfg)
             if not should_exit and sig != pos.direction:  # сигнал ушёл/развернулся
@@ -238,7 +283,8 @@ def tick(conn, cfg, verbose=True):
                 capital += pos.notional + pnl
                 side = "SELL" if pos.direction == 1 else "COVER"
                 db.log_paper_trade(conn, aid, sym, side, fill, pos.units,
-                                   pos.units * fill * fee, round(pnl, 2), reason)
+                                   pos.units * fill * fee, round(pnl, 2), reason,
+                                   mode=_position_mode(pos), provenance=_position_provenance(pos))
                 _del_position(conn, aid)
                 del positions[aid]
                 actions.append(f"{side} #{aid} {sym} @ {fill:.2f} ({reason}) PnL {pnl:+.2f}")
@@ -257,26 +303,31 @@ def tick(conn, cfg, verbose=True):
             if g.get("stop_atr"):
                 eff_risk["atr_stop_mult"] = g["stop_atr"]
             invest = rk.position_size(capital, eff_risk, atr_val, price)
+            invest = min(invest, capital / (1 + fee))
             if 0 < invest <= capital:
                 fill = price * (1 + slip * sig)
                 units = invest / fill
-                take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
-                capital -= invest
+                rr = risk_cfg.get("fixed_rr", g.get("rr"))
+                take_mult = (g["stop_atr"] * rr) if g.get("stop_atr") and rr else None
+                entry_fee = invest * fee
+                capital -= invest + entry_fee
                 p = rk.Position(aid, sym, fill, units, direction=sig,
                                 notional=invest, atr=atr_val,
                                 stop_mult=g.get("stop_atr"), take_mult=take_mult,
-                                trail_mult=g.get("trail_atr"))
+                                trail_mult=g.get("trail_atr"), entry_fee_paid=True)
                 p.opened_at = now_iso()
+                p.mark_price = price
                 positions[aid] = p
                 _save_position(conn, p)
                 side = "BUY" if sig == 1 else "SHORT"
                 db.log_paper_trade(conn, aid, sym, side, fill, units,
-                                   invest * fee, None, "signal")
+                                   entry_fee, None, "signal")
                 actions.append(f"{side} #{aid} {sym} @ {fill:.2f} (вложено {invest:.2f})")
 
     eq = equity_now()
     peak = max(peak, eq)
     _save_account(conn, capital, peak)
+    db.set_runtime_state(conn, "last_tick_at", now_iso())
 
     if verbose:
         flags = []
@@ -284,6 +335,10 @@ def tick(conn, cfg, verbose=True):
             flags.append("ДЕМО: агенты НЕ прошли отбор")
         if macro_block:
             flags.append("макро risk_off — входы стоп")
+        elif macro_unavailable:
+            flags.append("макро недоступно — входы разрешены по fail-open")
+        if catchup_truncated:
+            flags.append(f"минутная история ограничена {max_minutes} мин")
         if news_block:
             flags.append(f"новости: {news_reason} — входы стоп")
         if dd_halt:
@@ -311,13 +366,18 @@ def account_equity(conn, cfg):
     capital = acc["capital"]
     eq = capital
     npos = 0
-    for r in conn.execute("SELECT * FROM live_positions").fetchall():
+    for r in conn.execute(
+            "SELECT p.*, a.timeframe position_timeframe FROM live_positions p "
+            "LEFT JOIN agents a ON a.id=p.agent_id").fetchall():
         npos += 1
         try:
-            px = float(feed.fetch_recent(r["symbol"], cfg["timeframe"], 2)["close"].iloc[-1])
+            timeframe = r["position_timeframe"] or cfg["timeframe"]
+            px = float(feed.fetch_recent(r["symbol"], timeframe, 2)["close"].iloc[-1])
         except Exception:  # noqa
-            px = r["entry_price"]
-        eq += r["units"] * px
+            px = r["mark_price"] or r["entry_price"]
+        direction = r["direction"] or 1
+        notional = r["notional"] or r["units"] * r["entry_price"]
+        eq += notional * (1 + direction * (px / r["entry_price"] - 1))
     return capital, eq, npos
 
 

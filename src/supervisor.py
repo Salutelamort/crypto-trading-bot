@@ -7,17 +7,19 @@
 цикле принятия решений вообще — ни для стратегий, ни для управления.
 
 Здесь — "ворота допуска": агент, переживший эволюцию и стабильно показавший
-преимущество на нескольких out-of-sample окнах (walk-forward), ПРОДВИГАЕТСЯ к
+преимущество на нескольких validation-окнах (walk-forward), ПРОДВИГАЕТСЯ к
 живой торговле; слабый — УБИВАЕТСЯ. Это чистая селекция, а не мнение модели.
 
 Ключевые правила:
   - Разделяем метрики для ПРОДВИЖЕНИЯ и для УБИЙСТВА (нельзя подделать обе сразу).
   - consistency = доля walk-forward окон с прибылью (устойчивость во времени).
   - Низкая просадка обязательна (профиль: минимальный риск).
-  - Карантин символов и продвижение только по out-of-sample результатам.
+  - Карантин символов и продвижение по validation с финальной live-проверкой.
 """
 import json
+
 from . import db
+from . import genome as gn
 from . import metrics as mt
 
 
@@ -35,10 +37,13 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
     """Детерминированные правила выживания/допуска. Никакого LLM.
     sr0 — планка Deflated Sharpe: Sharpe ниже неё считаем возможной случайностью."""
     sup = cfg["supervisor"]
-    # планка sharpe-пути с поправкой на число испытаний (защита от самообмана)
-    sharpe_bar = max(sup["promote_min_sharpe"], sr0)
     decisions = []
     for a in agents:
+        g = json.loads(a["genome"])
+        valid, invalid_reason = gn.validate_genome(g)
+        family = (g.get("type", "?"), a["symbol"], a["timeframe"])
+        family_sr0 = sr0.get(family, 0.0) if isinstance(sr0, dict) else sr0
+        sharpe_bar = max(sup["promote_min_sharpe"], family_sr0)
         s = _agent_summary(a)
         ts = s["test_sharpe"] or -99
         dd = s["test_maxdd"] or 1.0
@@ -56,9 +61,13 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
         # --- ДОПУСК к живой торговле ---
         # База качества (общая для обоих путей): достаточно сделок, низкая просадка,
         # устойчивый обгон рынка по окнам, символ не в карантине.
-        base_ok = (trades >= sup["promote_min_trades"]
+        base_ok = (valid
+                   and trades >= sup["promote_min_trades"]
                    and cons >= sup["promote_min_consistency"]
                    and dd <= sup.get("promote_max_drawdown", 1.0)
+                   and (s["test_return"] or -99) > 0
+                   and ts > 0
+                   and pf >= sup.get("promote_min_pf", 1.1)
                    and a["symbol"] not in quarantined)
         # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha),
         # ЛИБО высокого Calmar (доход на единицу просадки — профиль низкого риска).
@@ -67,12 +76,15 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
                    or calmar >= sup.get("promote_min_calmar", 99))
         if base_ok and edge_ok:
             decisions.append((a["id"], "promote",
-                f"OOS Sharpe {ts:.2f}, Calmar {calmar:.2f}, PF {pf:.2f}, alpha {alpha:+.1%}, "
-                f"просадка {dd:.0%}, сделок {trades}, устойчивость {cons:.0%} — допущен"))
+                (f"Validation Sharpe {ts:.2f}, Calmar {calmar:.2f}, PF {pf:.2f}, "
+                 f"alpha {alpha:+.1%}, просадка {dd:.0%}, сделок {trades}, "
+                 f"устойчивость {cons:.0%} — допущен")))
         else:
+            invalid = f", невалидный геном: {invalid_reason}" if not valid else ""
             decisions.append((a["id"], "hold",
-                f"не дотягивает (Sharpe {ts:.2f}, Calmar {calmar:.2f}, alpha {alpha:+.1%}, "
-                f"просадка {dd:.0%}, trades {trades}, устойчивость {cons:.0%})"))
+                (f"не дотягивает (Sharpe {ts:.2f}, Calmar {calmar:.2f}, "
+                 f"alpha {alpha:+.1%}, PF {pf:.2f}, просадка {dd:.0%}, "
+                 f"trades {trades}, устойчивость {cons:.0%}{invalid})")))
     return decisions
 
 
@@ -157,14 +169,16 @@ def supervise(conn, cfg):
 
     # Deflated Sharpe: планка "лучшего по удаче" из РАСПРЕДЕЛЕНИЯ Sharpe всех испытаний
     # (всех когда-либо оценённых агентов), чтобы не поверить везунчику среди тысяч.
-    sr0 = 0.0
+    sr0 = {}
     if cfg["supervisor"].get("deflated_sharpe_enabled", True):
-        # из компактной сводки (T, sigma по всем испытаниям) — переживает прунинг
-        n_trials, sigma = db.trial_global_stats(conn)
-        sr0 = mt.expected_max_sharpe_from_stats(n_trials, sigma)
-        print(f"  Deflated Sharpe: планка случайности SR0={sr0:.2f} "
-              f"(по {n_trials} испытаниям) → sharpe-путь требует Sharpe >= "
-              f"max({cfg['supervisor']['promote_min_sharpe']}, {sr0:.2f})")
+        # Коррелированные поиски разных типов/рынков нельзя считать миллионами
+        # независимых ставок. Считаем SR0 отдельно в каждой семье.
+        family_stats = db.trial_family_stats(conn)
+        sr0 = {family: mt.expected_max_sharpe_from_stats(n, sigma)
+               for family, (n, sigma) in family_stats.items()}
+        bars = list(sr0.values())
+        print(f"  Deflated Sharpe: семейных планок {len(bars)}, "
+              f"диапазон SR0 {min(bars, default=0):.2f}…{max(bars, default=0):.2f}")
 
     print(f"\nОтбор эволюции оценивает {len(agents)} агентов (правила, без LLM)...")
     decisions = _decide(agents, cfg, quarantined, sr0)

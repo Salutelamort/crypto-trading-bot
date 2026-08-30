@@ -8,13 +8,17 @@
 
 Запуск: python dashboard.py  →  http://127.0.0.1:5000
 """
-import os
 import csv
 import json
-import time
-import threading
+import os
+import sqlite3
 import subprocess
+import tarfile
+import tempfile
+import threading
+import time
 
+import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
@@ -22,11 +26,40 @@ from src import db, macro_feed, news_feed
 
 app = Flask(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CFG = yaml.safe_load(open(os.path.join(ROOT, "config.yaml"), encoding="utf-8"))
+with open(os.path.join(ROOT, "config.yaml"), encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
 
 _MACRO = {"ts": 0, "data": None}
 _NEWS = {"ts": 0, "data": None}
 SYNC = {"ts": 0, "status": "ожидание...", "last_ok": None}
+STATE_LOCK = threading.RLock()
+STATE_URL = "https://github.com/Salutelamort/crypto-trading-bot/releases/download/bot-state/bot-state.tar.gz"
+
+
+def _download_state():
+    """Атомарно обновляет DB/CSV из release-asset и проверяет SQLite."""
+    response = requests.get(STATE_URL, timeout=90)
+    response.raise_for_status()
+    with tempfile.TemporaryDirectory(prefix="bot-state-") as tmp:
+        archive = os.path.join(tmp, "state.tar.gz")
+        with open(archive, "wb") as f:
+            f.write(response.content)
+        with tarfile.open(archive, "r:gz") as tf:
+            names = set(tf.getnames())
+            allowed = {"data/bot.db", "TRACK_RECORD.csv"}
+            if not names.issubset(allowed) or "data/bot.db" not in names:
+                raise RuntimeError(f"неожиданные файлы в state-asset: {sorted(names)}")
+            tf.extractall(tmp, filter="data")
+        candidate = os.path.join(tmp, "data", "bot.db")
+        with sqlite3.connect(candidate) as check_conn:
+            check = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if check != "ok":
+            raise RuntimeError(f"повреждённый state-asset: {check}")
+        with STATE_LOCK:
+            os.replace(candidate, os.path.join(ROOT, "data", "bot.db"))
+            csv_candidate = os.path.join(tmp, "TRACK_RECORD.csv")
+            if os.path.exists(csv_candidate):
+                os.replace(csv_candidate, os.path.join(ROOT, "TRACK_RECORD.csv"))
 
 
 # ---------- авто-синхронизация с облаком ----------
@@ -34,8 +67,9 @@ def _sync_loop():
     while True:
         try:
             r = subprocess.run(["git", "pull", "--no-edit"], cwd=ROOT,
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, text=True, timeout=90, check=False)
             if r.returncode == 0:
+                _download_state()
                 SYNC["status"] = "синхронизировано с облаком"
                 SYNC["last_ok"] = time.strftime("%H:%M:%S")
             else:
@@ -54,7 +88,8 @@ def _macro():
                 mc.get("asset", "BTC"), mc.get("lookback_days", 5),
                 mc.get("block_threshold_musd", 0))
         except Exception as e:  # noqa
-            _MACRO["data"] = {"bias": "neutral", "note": f"ошибка: {e}"}
+            _MACRO["data"] = {"available": False, "bias": "unavailable",
+                              "note": f"ошибка: {e}"}
         _MACRO["ts"] = time.time()
     return _MACRO["data"]
 
@@ -70,8 +105,7 @@ def _news():
     return _NEWS["data"]
 
 
-@app.route("/api/status")
-def api_status():
+def _status_payload():
     conn = db.connect(CFG["db_path"])
     out = {"counts": {}, "agents": [], "decisions": [], "trades": [], "paper": {}}
     for st in ("candidate", "promoted", "killed"):
@@ -92,14 +126,19 @@ def api_status():
             "ts": d["ts"][11:19], "agent_id": d["agent_id"],
             "action": d["action"], "rationale": d["rationale"]})
 
-    trades = conn.execute("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 30").fetchall()
-    for t in trades:
+    recent_trades = conn.execute(
+        "SELECT * FROM paper_trades WHERE mode IN ('live','legacy') "
+        "ORDER BY id DESC LIMIT 30").fetchall()
+    for t in recent_trades:
         out["trades"].append({
             "ts": t["ts"][11:19], "agent_id": t["agent_id"], "symbol": t["symbol"],
             "side": t["side"], "price": round(t["price"], 2),
             "pnl": t["pnl"], "reason": t["reason"]})
 
-    pnls = [t["pnl"] for t in trades if t["pnl"] is not None]
+    closed = conn.execute(
+        "SELECT pnl FROM paper_trades WHERE pnl IS NOT NULL "
+        "AND mode IN ('live','legacy') ORDER BY id").fetchall()
+    pnls = [t["pnl"] for t in closed]
     out["paper"] = {
         "closed_trades": len(pnls),
         "realized_pnl": round(sum(pnls), 2) if pnls else 0,
@@ -107,15 +146,36 @@ def api_status():
         "start_capital": CFG["paper"]["starting_capital"]}
 
     acc = conn.execute("SELECT * FROM live_account WHERE id=1").fetchone()
-    npos = conn.execute("SELECT COUNT(*) c FROM live_positions").fetchone()["c"]
-    out["live"] = {"capital": round(acc["capital"], 2) if acc else CFG["paper"]["starting_capital"],
-                   "open_positions": npos}
+    positions = conn.execute(
+        "SELECT p.*,a.timeframe FROM live_positions p LEFT JOIN agents a ON a.id=p.agent_id"
+    ).fetchall()
+    cash = acc["capital"] if acc else CFG["paper"]["starting_capital"]
+    equity = cash
+    for p in positions:
+        mark = conn.execute(
+            "SELECT close FROM candles WHERE symbol=? AND timeframe=? "
+            "ORDER BY open_time DESC LIMIT 1", (p["symbol"], p["timeframe"] or CFG["timeframe"])
+        ).fetchone()
+        price = p["mark_price"] or (mark["close"] if mark else p["entry_price"])
+        notional = p["notional"] or p["units"] * p["entry_price"]
+        direction = p["direction"] or 1
+        equity += notional * (1 + direction * (price / p["entry_price"] - 1))
+    peak = acc["peak_equity"] if acc else equity
+    out["live"] = {"capital": round(cash, 2), "equity": round(equity, 2),
+                   "drawdown": round(equity / peak - 1, 4) if peak else 0,
+                   "open_positions": len(positions)}
 
     out["macro"] = _macro()
     out["news"] = _news()
     out["sync"] = {"status": SYNC["status"], "last_ok": SYNC["last_ok"]}
     conn.close()
-    return jsonify(out)
+    return out
+
+
+@app.route("/api/status")
+def api_status():
+    with STATE_LOCK:
+        return jsonify(_status_payload())
 
 
 @app.route("/api/track")
@@ -123,7 +183,7 @@ def api_track():
     rows = []
     path = os.path.join(ROOT, "TRACK_RECORD.csv")
     try:
-        with open(path, encoding="utf-8") as f:
+        with STATE_LOCK, open(path, encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
     except FileNotFoundError:
         pass
@@ -190,7 +250,7 @@ tr:last-child td{border-bottom:none}
   <h2>Прогресс обучения (из облака, обновляется само)</h2>
   <div id="trackchart" style="margin-bottom:12px"></div>
   <div style="max-height:260px;overflow:auto">
-    <table><thead><tr><th>время (UTC)</th><th>капитал</th><th>кандидатов</th>
+    <table><thead><tr><th>время (UTC)</th><th>equity</th><th>кандидатов</th>
     <th>в live</th><th>лучший Sharpe</th><th>рынок</th><th>F&amp;G</th></tr></thead>
     <tbody id="track"></tbody></table>
   </div>
@@ -240,7 +300,7 @@ async function renderTrack(){
   const sh=d.map(r=>r.best_test_sharpe===''?null:parseFloat(r.best_test_sharpe));
   $('#trackchart').innerHTML='<div class="mut" style="margin-bottom:4px">Лучший Sharpe во времени (растёт к 0 и выше = бот находит преимущество)</div>'+lineChart(sh,640,150);
   $('#track').innerHTML=d.slice().reverse().slice(0,120).map(r=>`<tr>
-    <td class="mut">${r.date}</td><td>${num(r.capital,0)}</td>
+    <td class="mut">${r.date}</td><td>${num(r.equity,0)}</td>
     <td>${r.candidates}</td><td>${r.promoted}</td>
     <td class="${(parseFloat(r.best_test_sharpe)||0)>0?'pos':'neg'}">${r.best_test_sharpe||'—'}</td>
     <td class="mut">${r.macro_bias||''}</td><td class="mut">${r.fear_greed||''}</td></tr>`).join('')
@@ -257,10 +317,13 @@ async function refresh(){
   $('#news').innerHTML='<span class="badge '+ncls+'">Новости: '+(nw.block?'входы стоп':'спокойно')+
     '</span> <span class="mut">F&amp;G '+(fng.value??'—')+' '+(fng.label||'')+'</span>';
 
-  const cap=d.live.capital,start=d.paper.start_capital,ret=cap/start-1;
+  const cap=d.live.equity,start=d.paper.start_capital,ret=cap/start-1;
   $('#cards').innerHTML=`
-   <div class="card"><div class="l">Капитал (бумага)</div><div class="v ${cls(ret)}">${num(cap,0)}</div></div>
+   <div class="card"><div class="l">Equity (кэш + позиции)</div><div class="v ${cls(ret)}">${num(cap,0)}</div></div>
+   <div class="card"><div class="l">Свободный кэш</div><div class="v">${num(d.live.capital,0)}</div></div>
    <div class="card"><div class="l">Доходность</div><div class="v ${cls(ret)}">${(ret*100).toFixed(2)}%</div></div>
+   <div class="card"><div class="l">Реализованный PnL</div><div class="v ${cls(d.paper.realized_pnl)}">${num(d.paper.realized_pnl,0)}</div></div>
+   <div class="card"><div class="l">Закрытых live-сделок</div><div class="v">${d.paper.closed_trades}</div></div>
    <div class="card"><div class="l">Кандидаты</div><div class="v">${d.counts.candidate}</div></div>
    <div class="card"><div class="l">Продвинуто (live)</div><div class="v" style="color:var(--grn)">${d.counts.promoted}</div></div>
    <div class="card"><div class="l">Убито всего</div><div class="v" style="color:var(--red)">${d.counts.killed}</div></div>

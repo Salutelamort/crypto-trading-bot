@@ -9,19 +9,22 @@ A/B-эксперимент: сравнение соотношений риск/�
 Принцип из треда: не верить мнению ("надо R:R 3"), а измерять на данных.
 Запуск:  python experiment_rr.py
 """
-import os
 import copy
+import os
 import statistics
+
 import yaml
 
-from src import db, data_feed as feed, evolution, supervisor, paper_trade
+from src import data_feed as feed
+from src import db, evolution, paper_trade, supervisor
 
 SCRATCH = os.environ.get("TEMP", ".")
 
-# Варианты: (название, take_profit_pct). stop_loss_pct = 0.03 в обоих → R:R = tp/sl.
+# Варианты задают реальный ген ATR-R:R; прежний fixed take_profit_pct при
+# atr_stop=true вообще не участвовал в расчётах.
 VARIANTS = [
-    ("R:R 2:1", 0.06),
-    ("R:R 3:1", 0.09),
+    ("R:R 2:1", 2.0),
+    ("R:R 3:1", 3.0),
 ]
 
 
@@ -41,38 +44,42 @@ def agent_stats(conn):
     }
 
 
-def run_variant(name, take_profit, base_cfg, data):
+def run_variant(name, rr, base_cfg, data):
     cfg = copy.deepcopy(base_cfg)
-    cfg["risk"]["take_profit_pct"] = take_profit
+    cfg["risk"]["fixed_rr"] = rr
+    cfg["evolution"]["seed"] = 42
     cfg["macro"]["enabled"] = False   # выключаем сетевой фильтр для чистоты сравнения
-    cfg["db_path"] = os.path.join(SCRATCH, f"rr_{int(take_profit*100)}.db")
+    cfg["db_path"] = os.path.join(SCRATCH, f"rr_{int(rr)}.db")
 
     if os.path.exists(cfg["db_path"]):
         os.remove(cfg["db_path"])
     conn = db.connect(cfg["db_path"])
 
-    print(f"\n{'='*60}\n  ВАРИАНТ: {name}  (take_profit={take_profit}, stop=0.03)\n{'='*60}")
+    print(f"\n{'='*60}\n  ВАРИАНТ: {name}  (ATR R:R={rr:.1f})\n{'='*60}")
     evolution.evolve(conn, cfg, data)
     sup = supervisor.supervise(conn, cfg)
     paper = paper_trade.run_paper(conn, cfg, data)
 
-    res = {"name": name, "take_profit": take_profit,
+    res = {"name": name, "rr": rr,
            "promoted": sup.get("promote", 0), "agents": agent_stats(conn), "paper": paper}
     conn.close()
     return res
 
 
 def main():
-    base_cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    with open("config.yaml", encoding="utf-8") as f:
+        base_cfg = yaml.safe_load(f)
     # данные грузим ОДИН раз из основной базы (кэш свечей общий)
     main_conn = db.connect(base_cfg["db_path"])
     data = {}
     for sym in base_cfg["symbols"]:
-        df = feed.load_ohlcv(main_conn, sym, base_cfg["timeframe"])
-        if df.empty:
-            print(f"[!] Нет данных {sym}. Сначала: python main.py fetch")
-            return
-        data[sym] = df
+        for timeframe in base_cfg.get("timeframes", [base_cfg["timeframe"]]):
+            df = feed.load_ohlcv(main_conn, sym, timeframe)
+            if not df.empty:
+                data[(sym, timeframe)] = df
+    if not data:
+        print("[!] Нет данных. Сначала: python main.py fetch")
+        return
     main_conn.close()
 
     results = [run_variant(n, tp, base_cfg, data) for n, tp in VARIANTS]
