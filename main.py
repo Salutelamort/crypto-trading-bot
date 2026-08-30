@@ -3,7 +3,7 @@ CLI торгового бота для криптовалют.
 
 Архитектура (из r/algotrading, комментарий piratastuertos с фото):
   - Инфраструктура = детерминированный Python (data, indicators, backtest, risk)
-  - Управление = супервизор (правила или Claude): kill / promote / generate
+  - Управление = детерминированный супервизор: promote / hold / demote
   - Эволюция = генерация и отбор тысяч стратегий, выживают единицы
   - Всё в SQLite. Сначала бумага, потом (может быть) реальные деньги.
 
@@ -11,22 +11,18 @@ CLI торгового бота для криптовалют.
   python main.py fetch       # 1. скачать рыночные данные (Binance, без ключей)
   python main.py evolve      # 2. сгенерировать и отобрать агентов
   python main.py supervise   # 3. супервизор продвигает/убивает агентов
-  python main.py paper       # 4. форвард-тест продвинутых на out-of-sample
+  python main.py paper       # 4. историческая validation-симуляция портфеля
   python main.py status      # показать состояние популяции
   python main.py run         # всё подряд: fetch+evolve+supervise+paper
 """
-import sys
 import json
+import sys
 from datetime import datetime, timezone
 
 import yaml
 
-from src import db
 from src import data_feed as feed
-from src import evolution
-from src import supervisor
-from src import paper_trade
-from src import live_trade
+from src import db, evolution, live_trade, paper_trade, supervisor
 
 
 def load_cfg(path="config.yaml"):
@@ -109,18 +105,22 @@ def _parse_ts(s):
     return dt
 
 
-def _last_price(symbol, cfg, _cache={}):
+_PRICE_CACHE = {}
+_AGENT_TYPE_CACHE = {}
+
+
+def _last_price(symbol, cfg):
     """Свежая цена символа (mark-to-market открытых позиций). None если нет сети —
     тогда analyze честно откатится на цену входа (нулевая переоценка)."""
-    if symbol in _cache:
-        return _cache[symbol]
+    if symbol in _PRICE_CACHE:
+        return _PRICE_CACHE[symbol]
     px = None
     try:
         df = feed.fetch_recent(symbol, cfg["timeframe"], 2)
         px = float(df["close"].iloc[-1])
     except Exception:  # noqa — нет сети/данных → фолбэк на вход
         px = None
-    _cache[symbol] = px
+    _PRICE_CACHE[symbol] = px
     return px
 
 
@@ -129,10 +129,10 @@ def _pos_value(notional, direction, entry, price):
     return notional * (1 + direction * (price / entry - 1))
 
 
-def _agent_type(conn, agent_id, _cache={}):
+def _agent_type(conn, agent_id):
     """Тип стратегии (геном) по id агента, с кэшем."""
-    if agent_id in _cache:
-        return _cache[agent_id]
+    if agent_id in _AGENT_TYPE_CACHE:
+        return _AGENT_TYPE_CACHE[agent_id]
     row = conn.execute("SELECT genome FROM agents WHERE id=?", (agent_id,)).fetchone()
     t = "?"
     if row:
@@ -140,7 +140,7 @@ def _agent_type(conn, agent_id, _cache={}):
             t = json.loads(row["genome"]).get("type", "?")
         except (ValueError, TypeError):
             pass
-    _cache[agent_id] = t
+    _AGENT_TYPE_CACHE[agent_id] = t
     return t
 
 
@@ -160,9 +160,8 @@ def cmd_analyze(conn, cfg):
     pos_value = 0.0
     for p in pos:
         entry = p["entry_price"]
-        d = p["direction"] if "direction" in p.keys() and p["direction"] else 1
-        notional = p["notional"] if "notional" in p.keys() and p["notional"] \
-            else p["units"] * entry
+        d = p["direction"] or 1
+        notional = p["notional"] or p["units"] * entry
         live_px = _last_price(p["symbol"], cfg)
         px = live_px if live_px else entry
         src = "рынок" if live_px else "вход (нет сети)"
@@ -235,7 +234,7 @@ def cmd_analyze(conn, cfg):
     for p, px, src, val, unreal in marks:
         opened = _parse_ts(p["opened_at"])
         age = f"{(now - opened).total_seconds() / 3600:.1f}ч" if opened else "?"
-        d = p["direction"] if "direction" in p.keys() else None
+        d = p["direction"]
         side = {1: "LONG", -1: "SHORT"}.get(d, str(d))
         print(f"  {p['symbol']:8s} {side:5s} вход @ {p['entry_price']:.4f}  "
               f"тек. {px:.4f} ({src})  нереализ. {unreal:+.2f}  "

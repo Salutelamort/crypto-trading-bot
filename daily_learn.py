@@ -11,19 +11,36 @@
 непрерывно. За 3 месяца накапливается forward-track-record на невиданных данных.
 По нему ЧЕЛОВЕК потом решает про реальные деньги. Автоперехода НЕТ — мера безопасности.
 """
-import os
 import csv
-import time
 import datetime
+import json
+import os
+import time
+
 import yaml
 
-from src import db, data_feed as feed
-from src import evolution, supervisor, live_trade, macro_feed, news_feed
+from src import data_feed as feed
+from src import db, evolution, live_trade, macro_feed, news_feed, supervisor
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",
           "candidates", "promoted", "best_test_sharpe", "macro_bias",
           "fear_greed", "news_hits"]
+
+
+def _write_state_summary(conn, cfg, cycles, snapshot):
+    """Маленький отслеживаемый снимок; тяжёлая SQLite живёт в release-asset."""
+    payload = {
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "experiment_id": db.get_runtime_state(conn, "current_experiment", "legacy"),
+        **snapshot, "cycles": cycles,
+    }
+    os.makedirs("state", exist_ok=True)
+    tmp = "state/latest.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, "state/latest.json")
 
 
 def _journal(conn, cfg):
@@ -54,10 +71,14 @@ def _journal(conn, cfg):
         w.writerow(row)
     print(f"[{ts}] лучший Sharpe {best if best is not None else '—'} | "
           f"кандидатов {cand} | продвинуто {prom} | капитал {equity:,.0f}")
+    return {"equity": round(equity, 2), "free_cash": round(capital, 2),
+            "open_positions": npos, "candidates": cand, "promoted": prom,
+            "best_test_sharpe": best}
 
 
 def main():
-    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    with open("config.yaml", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
     conn = db.connect(cfg["db_path"])
 
     # бюджет времени на один облачный прогон (минут). Репо публичный → минуты
@@ -85,19 +106,21 @@ def main():
     evolution.reevaluate_promoted(conn, cfg, data)
     supervisor.supervise(conn, cfg)
     live_trade.tick(conn, cfg)
-    _journal(conn, cfg)
+    snapshot = _journal(conn, cfg)
+    _write_state_summary(conn, cfg, cycles, snapshot)
     print(f"\nГотово: циклов эволюции за прогон — {cycles}")
 
-    # RETENTION — держим bot.db лёгким (лимит GitHub на файл = 100 МБ):
-    #  - свечи не храним: следующий прогон перекачивает их заново;
+    # RETENTION — база теперь хранится сжатым release-asset, не в git-истории:
+    #  - свечи сохраняем для инкрементального обновления, старый хвост подрезаем;
     #  - мёртвых агентов и старые решения старше 7 дней сворачиваем в agent_stats
     #    (компактная память об испытаниях) и удаляем сырьё.
     # Память «что работает / что нет» при этом НЕ теряется — она в agent_stats.
-    conn.execute("DELETE FROM candles")
+    cutoff_ms = int((time.time() - (cfg["history_days"] + 7) * 86400) * 1000)
+    conn.execute("DELETE FROM candles WHERE open_time < ?", (cutoff_ms,))
     conn.commit()
     da, dd = db.prune_history(conn, keep_killed=3000, keep_decisions=8000)
     print(f"Retention: убрано killed-агентов {da}, старых решений {dd}")
-    conn.execute("VACUUM")
+    conn.execute("PRAGMA optimize")
     conn.close()
 
 

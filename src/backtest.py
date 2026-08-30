@@ -12,9 +12,10 @@
 Один вход → один детерминированный выход. LLM здесь нет вообще.
 """
 import pandas as pd
+
 from . import genome as gn
-from . import metrics as mt
 from . import indicators as ind
+from . import metrics as mt
 from . import risk as rk
 
 
@@ -27,8 +28,9 @@ def _effective_risk(genome, risk):
         r["atr_stop_mult"] = genome["stop_atr"]
     if genome.get("trail_atr"):
         r["atr_trail_mult"] = genome["trail_atr"]
-    if genome.get("stop_atr") and genome.get("rr"):
-        r["atr_take_mult"] = round(genome["stop_atr"] * genome["rr"], 3)
+    rr = risk.get("fixed_rr", genome.get("rr"))
+    if genome.get("stop_atr") and rr:
+        r["atr_take_mult"] = round(genome["stop_atr"] * rr, 3)
     return r
 
 
@@ -73,7 +75,6 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     costs = cfg["costs"]
     fee = costs["fee_pct"]
     slip = costs["slippage_pct"]
-    frac = risk["position_fraction"]
     allow_short = risk.get("allow_short", False)
     cooldown = int(genome.get("cooldown", 0))   # баров «отдыха» после выхода
 
@@ -111,7 +112,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
         nonlocal cash, in_pos, direction, cooldown_until
         exit_exec = exit_price * (1 - slip * direction)       # слиппедж всегда против нас
         gross = direction * (exit_exec / entry_exec - 1)      # доходность с учётом стороны
-        pnl = notional * (gross - 2 * fee)                    # комиссия на вход и выход
+        pnl = notional * gross - notional * (exit_exec / entry_exec) * fee
         trade_results.append(pnl)
         cash += notional + pnl
         in_pos = False
@@ -121,37 +122,48 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     for i in range(n):
         price = close[i]
         s = int(sig_arr[i])
+        closed_this_bar = False
 
         # --- управление открытой позицией: риск приоритетнее сигнала ---
         if in_pos:
+            # OHLC не хранит порядок high/low. Уровни берём с предыдущего бара;
+            # новый экстремум применяем только если позиция пережила текущий.
+            eff_stop, take = _exit_levels(direction, entry_exec, extreme, atr_entry, risk)
             if direction == 1:
-                extreme = max(extreme, high[i])
-                eff_stop, take = _exit_levels(1, entry_exec, extreme, atr_entry, risk)
                 if low[i] <= eff_stop:
                     close_pos(eff_stop, "stop")
+                    closed_this_bar = True
                 elif high[i] >= take:
                     close_pos(take, "take_profit")
+                    closed_this_bar = True
                 elif s != 1:
                     close_pos(price, "signal")
+                    closed_this_bar = True
+                else:
+                    extreme = max(extreme, high[i])
             else:  # short
-                extreme = min(extreme, low[i])
-                eff_stop, take = _exit_levels(-1, entry_exec, extreme, atr_entry, risk)
                 if high[i] >= eff_stop:
                     close_pos(eff_stop, "stop")
+                    closed_this_bar = True
                 elif low[i] <= take:
                     close_pos(take, "take_profit")
+                    closed_this_bar = True
                 elif s != -1:
                     close_pos(price, "signal")
+                    closed_this_bar = True
+                else:
+                    extreme = min(extreme, low[i])
 
         # --- вход по сигналу (после кулдауна; разворот тоже ждёт «отдыха») ---
-        if (not in_pos) and s != 0 and i >= cooldown_until:
+        if (not in_pos) and not closed_this_bar and s != 0 and i >= cooldown_until:
             direction = s
             # волатильность-таргетинг: доля от риска до стопа (risk parity)
             frac_eff = rk.sized_fraction(risk, atr_arr[i], price)
-            notional = cash * frac_eff
-            cash -= notional
+            notional = min(cash * frac_eff, cash / (1 + fee))
+            cash -= notional + notional * fee
             entry_exec = price * (1 + slip * direction)
-            extreme = high[i] if direction == 1 else low[i]
+            # Вход исполняется на close; high/low этой свечи уже в прошлом.
+            extreme = entry_exec
             atr_entry = atr_arr[i] if atr_arr[i] is not None else None
             in_pos = True
 
@@ -174,7 +186,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
 
 
 def split_train_test(df: pd.DataFrame, train_ratio: float):
-    """Разделение на in-sample / out-of-sample. Агент при отборе видит только train."""
+    """Разделение train/validation (validation повторно используется поиском)."""
     cut = int(len(df) * train_ratio)
     return df.iloc[:cut], df.iloc[cut:]
 
@@ -183,12 +195,12 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     """
     WALK-FORWARD валидация (совет из треда против переобучения).
 
-    Первая половина данных = in-sample (фитнес отбора). Вторая половина режется
+    Первая половина данных = train (фитнес отбора). Вторая половина режется
     на N окон, и агент проверяется в КАЖДОМ окне отдельно. Хорошая стратегия
     прибыльна в большинстве окон, а не в одном удачном.
 
     Возвращает (train_metrics, test_metrics_aggregated, robustness), где
-    robustness = доля out-of-sample окон с положительной доходностью (0..1).
+    robustness = доля validation-окон с положительной alpha (0..1).
     Эта robustness используется как метрика consistency при отборе.
     """
     import numpy as np
@@ -210,6 +222,9 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     idx = list(range(len(oos_df)))
     windows = [w for w in np.array_split(idx, nwin) if len(w) >= 50]
 
+    # Итоговые OOS-метрики считаются единым непрерывным прогоном. Усреднять
+    # Sharpe/PF/доходности по окнам математически некорректно.
+    test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[oos_start:])
     results = []
     for w in windows:
         a, b = int(w[0]), int(w[-1]) + 1
@@ -217,34 +232,21 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
         seg_sig = full_sig.iloc[oos_start + a:oos_start + b]
         results.append(run(genome, seg, cfg, sig=seg_sig))
 
-    if not results:  # данных мало — откат на единый OOS
-        test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[oos_start:])
+    if not results:  # данных мало — единый OOS без оценки устойчивости
         return train_m, test_m, 0.0
 
-    total_trades = sum(r["num_trades"] for r in results)
-    traded = [r for r in results if r["num_trades"] > 0]  # окна, где были сделки
-
-    # Агент, который НЕ торгует в out-of-sample, бесполезен → худший балл, не 0.0.
-    if total_trades == 0 or not traded:
+    # Агент, который НЕ торгует в validation, бесполезен → худший балл, не 0.0.
+    if test_m["num_trades"] == 0:
         test_m = {"sharpe": -99.0, "sortino": -99.0, "calmar": -99.0,
                   "profit_factor": 0.0, "total_return": 0.0, "win_rate": 0.0,
                   "num_trades": 0, "max_drawdown": 0.0, "buy_hold": 0.0, "alpha": 0.0}
         return train_m, test_m, 0.0
 
-    test_m = {
-        "sharpe": round(float(np.mean([r["sharpe"] for r in traded])), 3),
-        "sortino": round(float(np.mean([r["sortino"] for r in traded])), 3),
-        "calmar": round(float(np.mean([r["calmar"] for r in traded])), 3),
-        "profit_factor": round(float(np.mean([r["profit_factor"] for r in traded])), 3),
-        "total_return": round(float(np.mean([r["total_return"] for r in traded])), 4),
-        "win_rate": round(float(np.mean([r["win_rate"] for r in traded])), 3),
-        "num_trades": int(total_trades),
-        "max_drawdown": round(float(max(r["max_drawdown"] for r in traded)), 4),
-        "buy_hold": round(float(np.mean([r["buy_hold"] for r in traded])), 4),
-        "alpha": round(float(np.mean([r["alpha"] for r in traded])), 4),
-    }
     # УСТОЙЧИВОСТЬ = доля окон, где агент ОБОГНАЛ "купи и держи" (alpha > 0).
     # Так ценится не только заработок, но и сохранение капитала в падающем рынке:
     # потерять -5%, когда рынок упал -40%, — это победа (alpha = +35%).
-    robustness = round(sum(1 for r in traded if r["alpha"] > 0) / len(traded), 3)
+    # Окно без сделок — провал, а не исчезнувшее наблюдение.
+    robustness = round(
+        sum(1 for r in results if r["num_trades"] > 0 and r["alpha"] > 0)
+        / len(results), 3)
     return train_m, test_m, robustness

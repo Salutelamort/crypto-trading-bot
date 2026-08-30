@@ -21,13 +21,13 @@ python tests/golden_backtest.py
 новые числа верны). Golden ловит СЛУЧАЙНЫЕ поломки, не намеренные правки.
 
 ### 2. НИКОГДА не коммить локальный `data/bot.db`
-Облако (GitHub Actions, `.github/workflows/learn.yml`, каждые ~15 мин) ведёт СВОЮ
-накопительную forward-историю в `data/bot.db` и коммитит её в `main`. Если
-закоммитить локальную базу — затрёшь недели прогресса.
+Облако (GitHub Actions, `.github/workflows/learn.yml`) ведёт накопительную
+forward-историю в release-asset `bot-state`; tracked `data/bot.db` — только
+bootstrap. Если закоммитить локальную базу — можно затереть исходный снимок.
 - Коммить **только код** (и `config.yaml`, `docs/`, `tests/`).
 - Перед коммитом, если база изменилась локально от тестов:
   `git checkout origin/main -- data/bot.db`
-- При конфликте на push — решать **в пользу версии облака** (origin), не локальной.
+- Полное актуальное состояние восстанавливать из release `bot-state`, а не из git.
 - Схема БД мигрируется сама при `db.connect` (см. `_migrate` в `src/db.py`), руками
   ничего добавлять не нужно.
 
@@ -53,12 +53,12 @@ python tests/golden_backtest.py
 
 | Файл | Роль |
 |------|------|
-| `daily_learn.py` | Точка входа ОБЛАКА: fetch → evolve (пачкой) → supervise → live tick → журнал. В конце чистит свечи (база лёгкая). |
+| `daily_learn.py` | Точка входа ОБЛАКА: incremental fetch → evolve → supervise → live tick → журнал/state summary. |
 | `main.py` | CLI: `fetch / evolve / supervise / paper / live / status / run`. |
 | `src/genome.py` | 14 типов стратегий + гены риска (stop_atr, rr, trail_atr, cooldown). signal() → {-1,0,+1}: short/кэш/long. |
 | `src/backtest.py` | Детерминированный бэктест (long/short/кэш, ATR-стопы, кулдаун, vol-таргетинг). walk_forward_eval с embargo. |
 | `src/evolution.py` | Эволюция: генерация/мутация/отбор по квоте на символ, анти-клон по корреляции дохода. |
-| `src/supervisor.py` | Допуск к торговле: Sharpe(с Deflated-планкой) ИЛИ alpha ИЛИ Calmar + диверсификация. |
+| `src/supervisor.py` | Допуск: положительные return/Sharpe, PF≥порога, consistency/DD и семейный Deflated Sharpe/alpha/Calmar. |
 | `src/risk.py` | Position (long/short), уровни выхода (ATR), vol-таргетинг сайзинга (`sized_fraction`). |
 | `src/protections.py` | StoplossGuard (пауза после серии убытков) + блок плохих символов. |
 | `src/metrics.py` | Sharpe/Sortino/Calmar/ProfitFactor/alpha + `expected_max_sharpe` (Deflated Sharpe). |
@@ -73,7 +73,9 @@ python tests/golden_backtest.py
 мультитаймфрейм · диверсификация (анти-клон по корреляции + квота на символ + лимит
 1 позиция/символ) · метрики Sortino/Calmar/PF · protections · стратегии
 supertrend/macd_adx · оптимизация бэктеста · volatility-targeting сайзинга ·
-Deflated Sharpe · embargo. Все идеи из обзора репозиториев (раунды 1-2) ВНЕДРЕНЫ.
+семейный Deflated Sharpe · embargo · границы генов · provenance экспериментов ·
+catch-up минутных баров · CI. Validation используется многократно; только live
+paper считается настоящим forward.
 
 ## Текущий статус
 **Форвард-тест идёт в облаке** на консервативных настройках. Задача — ждать недели

@@ -3,11 +3,12 @@ SQLite-хранилище. Принцип из треда (piratastuertos): "SQL
 никакого Postgres, никакого Redis". Каждое решение записывается с обоснованием
 и ожидаемым результатом — архитектура построена вокруг отслеживаемости.
 """
-import sqlite3
+import hashlib
 import json
 import os
-from datetime import datetime, timezone, timedelta
-
+import sqlite3
+import subprocess
+from datetime import datetime, timezone
 
 SCHEMA = """
 -- Агенты = торговые стратегии с конкретными параметрами (геном).
@@ -22,15 +23,15 @@ CREATE TABLE IF NOT EXISTS agents (
     killed_at    TEXT,
     -- метрики in-sample (train)
     train_sharpe REAL, train_return REAL, train_winrate REAL, train_trades INTEGER,
-    -- метрики out-of-sample (test) — главный критерий честности
+    -- метрики повторно используемого validation (legacy-имя test_*)
     test_sharpe  REAL, test_return REAL, test_winrate REAL, test_trades INTEGER,
     test_maxdd   REAL,
-    test_buyhold REAL,                 -- доходность "купи и держи" за OOS-период
+    test_buyhold REAL,                 -- доходность "купи и держи" за validation
     test_alpha   REAL,                 -- обгон рынка = test_return - test_buyhold
     test_sortino REAL,                 -- Sortino (штраф только за просадки)
     test_calmar  REAL,                 -- Calmar (доход / макс. просадка)
     test_pf      REAL,                 -- profit factor (прибыли / убытки)
-    consistency  REAL                  -- доля OOS-окон с положительной alpha
+    consistency  REAL                  -- доля validation-окон с положительной alpha
 );
 
 -- Решения супервизора. Каждое — с обоснованием (отслеживаемость).
@@ -39,7 +40,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     ts          TEXT NOT NULL,
     agent_id    INTEGER,
     action      TEXT NOT NULL,         -- kill | promote | generate | hold
-    backend     TEXT NOT NULL,         -- rules | claude
+    backend     TEXT NOT NULL,         -- rules | evolution
     rationale   TEXT NOT NULL,         -- ПОЧЕМУ принято решение
     FOREIGN KEY(agent_id) REFERENCES agents(id)
 );
@@ -56,6 +57,10 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     fee         REAL NOT NULL,
     pnl         REAL,                  -- реализованный PnL при закрытии
     reason      TEXT,                  -- signal | stop_loss | trailing | take_profit
+    mode        TEXT NOT NULL DEFAULT 'legacy',
+    experiment_id TEXT NOT NULL DEFAULT 'legacy',
+    code_sha    TEXT,
+    config_hash TEXT,
     FOREIGN KEY(agent_id) REFERENCES agents(id)
 );
 
@@ -90,7 +95,29 @@ CREATE TABLE IF NOT EXISTS live_positions (
     entry_price REAL,
     units       REAL,
     peak_price  REAL,
-    opened_at   TEXT
+    opened_at   TEXT,
+    experiment_id TEXT NOT NULL DEFAULT 'legacy',
+    code_sha    TEXT,
+    config_hash TEXT,
+    last_checked_at TEXT,
+    mark_price REAL,
+    entry_fee_paid INTEGER NOT NULL DEFAULT 0
+);
+
+-- Служебные курсоры (например, последний успешно обработанный live-тик).
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- Неизменяемая метка форвард-когорты: код и конфигурация, которыми открыты сделки.
+CREATE TABLE IF NOT EXISTS experiments (
+    id          TEXT PRIMARY KEY,
+    started_at  TEXT NOT NULL,
+    code_sha    TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active'
 );
 
 -- КОМПАКТНАЯ ПАМЯТЬ ОБ ИСПЫТАНИЯХ (агрегат по тип×символ×таймфрейм).
@@ -140,7 +167,100 @@ def _migrate(conn):
         conn.execute("ALTER TABLE live_positions ADD COLUMN notional REAL")
     if "atr" not in pcols:
         conn.execute("ALTER TABLE live_positions ADD COLUMN atr REAL")
+    for col, spec in (
+            ("experiment_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("code_sha", "TEXT"), ("config_hash", "TEXT"),
+            ("last_checked_at", "TEXT"), ("mark_price", "REAL"),
+            ("entry_fee_paid", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in pcols:
+            conn.execute(f"ALTER TABLE live_positions ADD COLUMN {col} {spec}")
+    tcols = {r["name"] for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+    for col, spec in (
+            ("mode", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("experiment_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("code_sha", "TEXT"), ("config_hash", "TEXT")):
+        if col not in tcols:
+            conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {spec}")
     conn.commit()
+
+
+def get_runtime_state(conn, key, default=None):
+    row = conn.execute("SELECT value FROM runtime_state WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_runtime_state(conn, key, value):
+    conn.execute(
+        "INSERT INTO runtime_state(key,value,updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, str(value), now_iso()),
+    )
+    conn.commit()
+
+
+def _code_sha():
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            check=True, timeout=3,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _source_hash():
+    """Стабильный fingerprint логики; auto-коммиты CSV/state его не меняют."""
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files"], capture_output=True, text=True,
+            check=True, timeout=3,
+        ).stdout.splitlines()
+        relevant = sorted(
+            p for p in listed
+            if ((p.startswith("src/") and p.endswith(".py"))
+                or p in {"main.py", "daily_learn.py", "config.yaml",
+                         "requirements.txt", "requirements.lock"})
+        )
+        digest = hashlib.sha256()
+        for path in relevant:
+            digest.update(path.encode("utf-8") + b"\0")
+            with open(path, "rb") as f:
+                digest.update(f.read())
+        return digest.hexdigest()[:16]
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def ensure_experiment(conn, cfg):
+    """Регистрирует текущую forward-когорту без сброса счёта или старых сделок."""
+    raw = json.dumps(cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    config_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    code_sha = _code_sha()
+    source_hash = _source_hash()
+    requested = cfg.get("experiment", {}).get("id", "paper-forward")
+    experiment_id = f"{requested}:{config_hash}:{source_hash}"
+    conn.execute(
+        "INSERT OR IGNORE INTO experiments(id,started_at,code_sha,config_hash,status) "
+        "VALUES (?,?,?,?, 'active')",
+        (experiment_id, now_iso(), code_sha, config_hash),
+    )
+    set_runtime_state(conn, "current_experiment", experiment_id)
+    return {"experiment_id": experiment_id, "code_sha": code_sha,
+            "config_hash": config_hash}
+
+
+def current_provenance(conn):
+    experiment_id = get_runtime_state(conn, "current_experiment", "legacy")
+    row = conn.execute(
+        "SELECT code_sha,config_hash FROM experiments WHERE id=?", (experiment_id,)
+    ).fetchone()
+    if not row:
+        return {"experiment_id": "legacy", "code_sha": None, "config_hash": None}
+    return {"experiment_id": experiment_id, "code_sha": row["code_sha"],
+            "config_hash": row["config_hash"]}
 
 
 # ---------- агенты ----------
@@ -245,6 +365,22 @@ def trial_global_stats(conn):
     return n, sigma
 
 
+def trial_family_stats(conn):
+    """Планка множественного тестирования отдельно по типу/символу/ТФ."""
+    out = {}
+    for r in conn.execute(
+            "SELECT type,symbol,timeframe,n_trials,sum_sharpe,sumsq_sharpe FROM agent_stats"
+            ).fetchall():
+        n = r["n_trials"] or 0
+        sigma = 0.0
+        if n >= 2:
+            mean = r["sum_sharpe"] / n
+            var = (r["sumsq_sharpe"] - r["sum_sharpe"] * mean) / (n - 1)
+            sigma = var ** 0.5 if var > 0 else 0.0
+        out[(r["type"], r["symbol"], r["timeframe"])] = (n, sigma)
+    return out
+
+
 def best_sharpe_ever(conn):
     """Лучший test_sharpe за всю историю (из сводки). None если пусто."""
     return conn.execute("SELECT MAX(max_sharpe) m FROM agent_stats").fetchone()["m"]
@@ -311,7 +447,7 @@ def prune_history(conn, keep_killed=3000, keep_decisions=8000):
     return da, dd
 
 
-def get_agents(conn, status: str = None):
+def get_agents(conn, status: str | None = None):
     if status:
         rows = conn.execute("SELECT * FROM agents WHERE status=? ORDER BY id", (status,)).fetchall()
     else:
@@ -343,10 +479,14 @@ def quarantined_symbols(conn) -> set:
 
 
 # ---------- сделки ----------
-def log_paper_trade(conn, agent_id, symbol, side, price, qty, fee, pnl, reason):
+def log_paper_trade(conn, agent_id, symbol, side, price, qty, fee, pnl, reason,
+                    mode="live", provenance=None):
+    provenance = provenance or current_provenance(conn)
     conn.execute(
-        "INSERT INTO paper_trades (agent_id, symbol, side, ts, price, qty, fee, pnl, reason) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (agent_id, symbol, side, now_iso(), price, qty, fee, pnl, reason),
+        "INSERT INTO paper_trades "
+        "(agent_id,symbol,side,ts,price,qty,fee,pnl,reason,mode,experiment_id,code_sha,config_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (agent_id, symbol, side, now_iso(), price, qty, fee, pnl, reason, mode,
+         provenance["experiment_id"], provenance["code_sha"], provenance["config_hash"]),
     )
     conn.commit()

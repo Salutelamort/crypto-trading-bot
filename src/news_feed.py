@@ -15,6 +15,7 @@
   - "Extreme Greed" (рынок перегрет) → блок новых входов (профиль = низкий риск).
 """
 import re
+
 import requests
 
 _H = {"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"}
@@ -50,7 +51,7 @@ def _headlines():
     for url in _RSS:
         try:
             r = requests.get(url, timeout=12, headers=_H)
-            for t in re.findall(r"<title>(.*?)</title>", r.text, re.S):
+            for t in re.findall(r"<title>(.*?)</title>", r.text, re.DOTALL):
                 t = re.sub(r"<!\[CDATA\[|\]\]>", "", t).strip()
                 if t and "rss" not in t.lower():
                     titles.append(t)
@@ -105,5 +106,6 @@ def news_gate(cfg):
 
 if __name__ == "__main__":
     import yaml
-    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    with open("config.yaml", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
     print(news_gate(cfg))

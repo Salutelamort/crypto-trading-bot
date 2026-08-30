@@ -9,7 +9,7 @@
 
 Никакого LLM — чистый SQL по журналу сделок paper_trades.
 """
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 # закрывающие сделки (по ним считаем реализованный PnL)
 _CLOSE_SIDES = ("SELL", "COVER")
