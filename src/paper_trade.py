@@ -3,23 +3,21 @@
 прежде чем вкладывать реальные деньги. Бумага игнорирует проскальзывание и
 спред — мы их учитываем."
 
-Здесь — ПОРТФЕЛЬНАЯ форвард-симуляция: берём агентов, продвинутых супервизором,
-и торгуем ими совместно на out-of-sample данных (которые не использовались при
-отборе). Это и есть честный форвард-тест перед реальными деньгами.
+Здесь — ПОРТФЕЛЬНАЯ историческая симуляция: берём агентов, продвинутых
+супервизором, и торгуем ими на validation. Этот участок уже использовался
+поиском, поэтому это диагностика, НЕ live-forward.
 
 Общий капитал, общий лимит позиций, риск-менеджмент на каждой позиции.
 Все сделки пишутся в SQLite (отслеживаемость). LLM здесь не участвует —
 торговля 100% детерминированная.
 """
 import json
-import pandas as pd
 
-from . import db
 from . import backtest as bt
+from . import db, macro_feed
 from . import genome as gn
-from . import risk as rk
-from . import macro_feed
 from . import indicators as ind
+from . import risk as rk
 
 
 def _macro_blocks_entries(cfg) -> bool:
@@ -31,13 +29,15 @@ def _macro_blocks_entries(cfg) -> bool:
         mc.get("asset", "BTC"), mc.get("lookback_days", 5),
         mc.get("block_threshold_musd", 0))
     print(f"  Макро-страж: {info.get('note', info)}")
-    blocked = info["bias"] == "risk_off"
+    blocked = info["bias"] == "risk_off" or (
+        not info.get("available", False) and mc.get("fail_closed", False))
     if blocked:
         print("  [!] risk_off — новые входы заблокированы (выходы работают как обычно).")
     return blocked
 
 
 def run_paper(conn, cfg, data_by_key):
+    db.ensure_experiment(conn, cfg)
     promoted = db.get_agents(conn, "promoted")
     if not promoted:
         print("Нет продвинутых агентов. Запусти эволюцию и супервизора.")
@@ -53,7 +53,7 @@ def run_paper(conn, cfg, data_by_key):
     atr_period = risk_cfg.get("atr_period", 14)
     use_atr = risk_cfg.get("atr_stop", False)
 
-    # Готовим для каждого агента: out-of-sample df + предрассчитанный сигнал + ATR.
+    # Для каждого агента: validation df + предрассчитанный сигнал + ATR.
     streams = []
     for a in promoted:
         sym = a["symbol"]
@@ -97,6 +97,7 @@ def run_paper(conn, cfg, data_by_key):
             price = float(s["df"].loc[ts, "close"])
             last_price[a["symbol"]] = price
             pos = open_positions.get(aid)
+            exited_this_bar = False
 
             # Текущий капитал портфеля (mark-to-market) и просадка.
             equity = capital + sum(
@@ -111,7 +112,9 @@ def run_paper(conn, cfg, data_by_key):
 
             # 1. Управление открытой позицией (риск приоритетнее сигнала).
             if pos is not None:
-                should_exit, reason, exit_price = pos.exit_check_hl(price, price, price, risk_cfg)
+                high = float(s["df"].loc[ts, "high"])
+                low = float(s["df"].loc[ts, "low"])
+                should_exit, reason, exit_price = pos.exit_check_hl(high, low, price, risk_cfg)
                 if not should_exit and sig_now != pos.direction:
                     should_exit, reason, exit_price = True, "signal", price
                 if should_exit:
@@ -124,15 +127,17 @@ def run_paper(conn, cfg, data_by_key):
                     side = "SELL" if pos.direction == 1 else "COVER"
                     db.log_paper_trade(conn, aid, a["symbol"], side,
                                        fill, pos.units, pos.units * fill * fee,
-                                       round(pnl, 2), reason)
+                                       round(pnl, 2), reason, mode="historical")
                     del open_positions[aid]
                     cooldown_left[aid] = int(s["g"].get("cooldown", 0))
+                    exited_this_bar = True
             elif aid not in open_positions and cooldown_left.get(aid, 0) > 0:
                 cooldown_left[aid] -= 1   # «отдыхаем» после выхода
 
             # 2. Вход (long или short): лимит, макро-страж, стоп-кран И кулдаун.
             sym_count = sum(1 for p in open_positions.values() if p.symbol == a["symbol"])
-            if aid not in open_positions and (not macro_block) and (not dd_halt) \
+            if aid not in open_positions and not exited_this_bar \
+                    and (not macro_block) and (not dd_halt) \
                     and sig_now != 0 and cooldown_left.get(aid, 0) <= 0 \
                     and sym_count < risk_cfg.get("max_positions_per_symbol", 99) \
                     and rk.can_open(len(open_positions), risk_cfg):
@@ -143,19 +148,23 @@ def run_paper(conn, cfg, data_by_key):
                 if g.get("stop_atr"):
                     eff_risk["atr_stop_mult"] = g["stop_atr"]
                 invest = rk.position_size(capital, eff_risk, atr_val, price)
+                invest = min(invest, capital / (1 + fee))
                 if invest <= 0 or invest > capital:
                     continue
                 fill = price * (1 + slip * sig_now)
                 units = invest / fill
-                take_mult = (g["stop_atr"] * g["rr"]) if g.get("stop_atr") and g.get("rr") else None
-                capital -= invest
+                rr = risk_cfg.get("fixed_rr", g.get("rr"))
+                take_mult = (g["stop_atr"] * rr) if g.get("stop_atr") and rr else None
+                entry_fee = invest * fee
+                capital -= invest + entry_fee
                 open_positions[aid] = rk.Position(
                     aid, a["symbol"], fill, units, direction=sig_now, notional=invest,
                     atr=atr_val, stop_mult=g.get("stop_atr"), take_mult=take_mult,
-                    trail_mult=g.get("trail_atr"))
+                    trail_mult=g.get("trail_atr"), entry_fee_paid=True)
                 side = "BUY" if sig_now == 1 else "SHORT"
                 db.log_paper_trade(conn, aid, a["symbol"], side,
-                                   fill, units, invest * fee, None, "signal")
+                                   fill, units, entry_fee, None, "signal",
+                                   mode="historical")
 
     # Закрываем остатки по последней цене (mark-to-market, long и short).
     for aid, pos in list(open_positions.items()):
@@ -168,7 +177,7 @@ def run_paper(conn, cfg, data_by_key):
     start = float(cfg["paper"]["starting_capital"])
     total_ret = capital / start - 1
     wr = wins / trade_count if trade_count else 0
-    print("\n--- Результат бумажной торговли (out-of-sample) ---")
+    print("\n--- Результат исторической бумажной симуляции (validation) ---")
     print(f"  Стартовый капитал:  {start:,.0f} USDT")
     print(f"  Итоговый капитал:   {capital:,.2f} USDT")
     print(f"  Доходность:         {total_ret:+.2%}")
@@ -177,8 +186,7 @@ def run_paper(conn, cfg, data_by_key):
     if dd_halt_bars:
         print(f"  Стоп-кран просадки сработал на {dd_halt_bars} барах "
               f"(блокировал новые входы при просадке >{dd_limit:.0%})")
-    print("\n  Напоминание из треда: это форвард-тест на данных, которых агенты")
-    print("  не видели при отборе. Прежде чем рисковать реальными деньгами —")
-    print("  гоняй демо НЕДЕЛИ. Бэктест и даже бумага не учитывают дрейф рынка.")
+    print("\n  Это повторно используемая validation, не доказательство edge.")
+    print("  Финальная проверка — отдельная live paper-когорта на будущих данных.")
     return {"start": start, "final": capital, "return": total_ret,
             "trades": trade_count, "win_rate": wr, "dd_halt_bars": dd_halt_bars}

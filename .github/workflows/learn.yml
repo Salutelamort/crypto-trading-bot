@@ -20,21 +20,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Восстановить состояние из release-asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .state
+          gh release download bot-state -p bot-state.tar.gz -D .state || true
+          if [ -f .state/bot-state.tar.gz ]; then
+            tar -xzf .state/bot-state.tar.gz
+          fi
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Установить зависимости
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.lock
 
       - name: День обучения
         run: python daily_learn.py
+
+      - name: Сохранить полное состояние вне git-истории
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf /tmp/bot-state.tar.gz data/bot.db TRACK_RECORD.csv
+          gh release view bot-state >/dev/null 2>&1 || \
+            gh release create bot-state --title "Bot state" \
+              --notes "Автоматический полный снимок paper-состояния."
+          gh release upload bot-state /tmp/bot-state.tar.gz --clobber
 
       - name: Сохранить обучение обратно в репозиторий
         run: |
           git config user.name  "trading-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add data/bot.db TRACK_RECORD.csv
+          git restore -- data/bot.db
+          git add TRACK_RECORD.csv state/latest.json
           git commit -m "auto-learn $(date -u +%F)" || echo "нет новых изменений для коммита"
           # Ретраи: транзиентные сбои GitHub (fatal error in commit_refs, гонки
           # push между прогонами) сами рассасываются за пару попыток — раньше

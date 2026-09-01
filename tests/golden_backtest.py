@@ -11,14 +11,15 @@ GOLDEN-регрессионный тест ядра бэктеста.
 
 Данные синтетические (сид фиксирован) → тест НЕ зависит от сети/биржи.
 """
-import sys
-import os
 import json
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src import backtest as bt   # noqa: E402
+from src import backtest as bt
 
 GOLDEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_backtest.json")
 

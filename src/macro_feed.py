@@ -19,8 +19,9 @@
 и ничего не блокирует.
 """
 import io
-import requests
+
 import pandas as pd
+import requests
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -66,17 +67,19 @@ def etf_flow_bias(asset: str = "BTC", lookback_days: int = 5,
     """
     url = _URLS.get(asset.upper())
     if not url:
-        return {"bias": "neutral", "net_flow": 0.0, "note": f"нет данных для {asset}"}
+        return {"available": False, "bias": "unavailable", "net_flow": None,
+                "note": f"нет данных для {asset}"}
     try:
         r = requests.get(url, headers=_HEADERS, timeout=20)
         r.raise_for_status()
         flows = _parse_total_flows(r.text)
     except Exception as e:  # noqa
-        return {"bias": "neutral", "net_flow": 0.0,
-                "note": f"farside недоступен ({type(e).__name__}) — фильтр выключен"}
+        return {"available": False, "bias": "unavailable", "net_flow": None,
+                "note": f"farside недоступен ({type(e).__name__}); см. macro.fail_closed"}
 
     if flows.empty:
-        return {"bias": "neutral", "net_flow": 0.0, "note": "не удалось распарсить таблицу"}
+        return {"available": False, "bias": "unavailable", "net_flow": None,
+                "note": "не удалось распарсить таблицу"}
 
     recent = flows.tail(lookback_days)
     net = float(recent.sum())
@@ -86,8 +89,8 @@ def etf_flow_bias(asset: str = "BTC", lookback_days: int = 5,
         bias = "risk_off"
     else:
         bias = "neutral"
-    return {"bias": bias, "net_flow": round(net, 1),
-            "days": int(len(recent)), "last_date": str(flows.index[-1].date()),
+    return {"available": True, "bias": bias, "net_flow": round(net, 1),
+            "days": len(recent), "last_date": str(flows.index[-1].date()),
             "note": f"{asset} ETF: чистый поток {net:+.0f}M$ за {len(recent)}д"}
 
 

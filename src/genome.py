@@ -27,8 +27,10 @@
 (для spot он отключается, для фьючерс-/демо-режима — включён).
 """
 import random
+
 import numpy as np
 import pandas as pd
+
 from . import indicators as ind
 
 STRATEGY_TYPES = [
@@ -45,6 +47,69 @@ STRATEGY_TYPES = [
     "supertrend",         # ATR-трендследование (популярно в Freqtrade/TradingView)
     "macd_adx",           # MACD-кросс + фильтр силы тренда ADX (не торгуем в боковике)
 ]
+
+# Жёсткие границы поискового пространства. Они не дают мутациям превращать
+# lookback в 2 бара, vol_mult в 0.2 или trailing-stop в 0.5 ATR — такие геномы
+# раньше выглядели блестяще только из-за шума и особенностей симулятора.
+COMMON_BOUNDS = {
+    "stop_atr": (1.0, 3.5), "rr": (2.0, 5.0),
+    "trail_atr": (1.0, 4.0), "cooldown": (0, 24),
+}
+TYPE_BOUNDS = {
+    "mean_reversion": {"period": (10, 80), "z_entry": (-3.0, -0.8)},
+    "momentum": {"rsi_period": (5, 30), "rsi_entry": (45, 70)},
+    "breakout": {"lookback": (10, 150)},
+    "ma_cross": {"fast": (5, 60), "slow": (30, 250)},
+    "pullback_trend": {"trend_ma": (30, 250), "rsi_period": (2, 30), "rsi_dip": (10, 45)},
+    "failure_test": {"lookback": (10, 100)},
+    "breakout_retest": {"lookback": (10, 100), "confirm": (1, 4)},
+    "donchian_trend": {"entry_ch": (10, 100), "exit_ch": (5, 50)},
+    "vol_breakout": {"atr_period": (5, 40), "lookback": (10, 100), "squeeze": (0.4, 1.0)},
+    "mtf_trend": {"fast": (5, 40), "mid": (30, 100), "slow": (80, 250)},
+    "wyckoff_breakout": {"lookback": (10, 100), "vol_mult": (1.2, 3.0)},
+    "williams_volatility": {"atr_period": (5, 30), "k": (0.3, 2.0)},
+    "supertrend": {"st_period": (5, 30), "st_mult": (1.5, 5.0)},
+    "macd_adx": {"adx_min": (15, 45)},
+}
+INTEGER_GENES = {
+    "period", "rsi_period", "rsi_entry", "lookback", "fast", "slow",
+    "trend_ma", "rsi_dip", "confirm", "entry_ch", "exit_ch", "atr_period",
+    "mid", "st_period", "adx_min", "cooldown",
+}
+
+
+def clamp_genome(genome: dict) -> dict:
+    """Возвращает канонический геном внутри разрешённого пространства."""
+    g = dict(genome)
+    bounds = {**COMMON_BOUNDS, **TYPE_BOUNDS.get(g.get("type"), {})}
+    for key, (lo, hi) in bounds.items():
+        if key not in g:
+            continue
+        value = max(lo, min(hi, g[key]))
+        g[key] = round(value) if key in INTEGER_GENES else round(float(value), 2)
+    if g.get("type") == "ma_cross":
+        g["slow"] = min(250, max(g["slow"], g["fast"] + 20))
+    elif g.get("type") == "donchian_trend":
+        g["exit_ch"] = min(g["exit_ch"], g["entry_ch"])
+    elif g.get("type") == "mtf_trend":
+        g["mid"] = min(100, max(g["mid"], g["fast"] + 10))
+        g["slow"] = min(250, max(g["slow"], g["mid"] + 20))
+    return g
+
+
+def validate_genome(genome: dict) -> tuple[bool, str]:
+    """Проверяет старые и новые геномы; невалидные нельзя допускать в live."""
+    if genome.get("type") not in STRATEGY_TYPES:
+        return False, "неизвестный тип"
+    required = set(TYPE_BOUNDS[genome["type"]]) | set(COMMON_BOUNDS)
+    missing = sorted(k for k in required if k not in genome)
+    if missing:
+        return False, f"нет генов: {', '.join(missing)}"
+    normalized = clamp_genome(genome)
+    for key in required:
+        if normalized.get(key) != genome.get(key):
+            return False, f"ген {key} вне допустимого диапазона"
+    return True, "ok"
 
 
 def random_genome(symbol: str, timeframe: str, rng: random.Random) -> dict:
@@ -124,7 +189,7 @@ def random_genome(symbol: str, timeframe: str, rng: random.Random) -> dict:
     g["trail_atr"] = round(rng.uniform(1.5, 4.0), 2)   # trailing = trail_atr × ATR
     # КУЛДАУН против переторговли ("тысяча порезов"): минимум баров между сделками.
     g["cooldown"] = rng.choice([0, 3, 6, 12, 24])
-    return g
+    return clamp_genome(g)
 
 
 def mutate(genome: dict, rng: random.Random) -> dict:
@@ -141,24 +206,7 @@ def mutate(genome: dict, rng: random.Random) -> dict:
         g[k] = max(2, v + rng.choice([-10, -5, -2, 2, 5, 10]))
     else:  # float (z_entry, squeeze, гены риска)
         g[k] = round(v + rng.choice([-0.3, -0.1, 0.1, 0.3]), 2)
-    # инварианты генов риска: стоп/трейл > 0, R:R >= 1
-    if "stop_atr" in g:
-        g["stop_atr"] = round(max(0.5, g["stop_atr"]), 2)
-    if "trail_atr" in g:
-        g["trail_atr"] = round(max(0.5, g["trail_atr"]), 2)
-    if "rr" in g:
-        g["rr"] = round(max(1.0, g["rr"]), 1)
-    if "st_mult" in g:
-        g["st_mult"] = round(max(1.0, g["st_mult"]), 1)
-    # инварианты
-    if g["type"] == "ma_cross":
-        g["slow"] = max(g["slow"], g["fast"] + 20)
-    if g["type"] == "donchian_trend":
-        g["exit_ch"] = min(g.get("exit_ch", 10), g.get("entry_ch", 20))
-    if g["type"] == "mtf_trend":  # стек должен сохранять порядок fast<mid<slow
-        g["mid"] = max(g["mid"], g["fast"] + 10)
-        g["slow"] = max(g["slow"], g["mid"] + 20)
-    return g
+    return clamp_genome(g)
 
 
 def _state_from_entries(index, entry: pd.Series, exit_: pd.Series) -> pd.Series:
