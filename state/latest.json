@@ -1,9 +1,9 @@
 {
-  "updated_at": "2026-09-02T15:20:44.288263+00:00",
+  "updated_at": "2026-09-02T18:51:42.296998+00:00",
   "experiment_id": "audit-v2:744bd14e91b827e5:cce0bb77a79bdc07",
-  "equity": 9996.58,
-  "free_cash": 8482.4,
-  "open_positions": 2,
+  "equity": 9982.66,
+  "free_cash": 9425.92,
+  "open_positions": 1,
   "candidates": 5,
   "promoted": 2,
   "best_test_sharpe": 8.969,
