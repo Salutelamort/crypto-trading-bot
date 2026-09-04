@@ -1,11 +1,11 @@
 {
-  "updated_at": "2026-09-04T20:21:20.976593+00:00",
+  "updated_at": "2026-09-04T22:29:54.446907+00:00",
   "experiment_id": "audit-v2:744bd14e91b827e5:cce0bb77a79bdc07",
-  "equity": 9939.58,
+  "equity": 9945.35,
   "free_cash": 9425.92,
   "open_positions": 1,
-  "candidates": 6,
+  "candidates": 7,
   "promoted": 1,
   "best_test_sharpe": 8.969,
-  "cycles": 21
+  "cycles": 19
 }
