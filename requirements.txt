@@ -1,5 +1,6 @@
 # Инфраструктура — чистый Python (принцип из треда: LLM не считает математику)
 requests==2.34.2
+websocket-client==1.9.2
 pandas==2.2.3
 numpy==2.3.5
 PyYAML==6.0.3

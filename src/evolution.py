@@ -15,6 +15,7 @@
 ВАЖНО: эволюция НЕ продвигает агентов в реальную торговлю. Это делает
 супервизор (supervisor.py) — отдельное управленческое решение.
 """
+import copy
 import json
 import random
 
@@ -45,7 +46,20 @@ def _fitness(agent, min_trades):
 
 def _evaluate(genome, df, cfg):
     """Walk-forward оценка агента. consistency = доля прибыльных OOS окон."""
-    return bt.walk_forward_eval(genome, df, cfg)
+    train, test, consistency = bt.walk_forward_eval(genome, df, cfg)
+    factors = cfg.get("validation", {}).get("cost_stress_multipliers", [])
+    if factors and test["total_return"] > 0 and test["num_trades"] >= cfg["supervisor"].get("promote_min_trades", 20):
+        start = int(len(df) * cfg["train_ratio"]) + cfg.get("validation", {}).get("embargo_bars", 0)
+        signal = gn.signal(genome, df, cfg["risk"].get("allow_short", False)).shift(
+            cfg.get("execution", {}).get("signal_delay_bars", 1)).fillna(0)
+        stressed_results = []
+        for factor in factors:
+            stressed = copy.deepcopy(cfg)
+            stressed["costs"] = {key: value * factor for key, value in cfg["costs"].items()}
+            stressed_results.append(bt.run(genome, df.iloc[start:], stressed, sig=signal.iloc[start:]))
+        test["stress_return"] = min(item["total_return"] for item in stressed_results)
+        test["stress_pf"] = min(item["profit_factor"] for item in stressed_results)
+    return train, test, consistency
 
 
 def reevaluate_promoted(conn, cfg, data_by_key):
@@ -106,13 +120,22 @@ def _proven_symbols(conn, cfg, symbols):
 
 def _oos_returns(genome, df, cfg):
     """Доходности агента на validation-участке (для матрицы корреляций)."""
-    cut = int(len(df) * cfg["train_ratio"])
+    cut = int(len(df) * cfg["train_ratio"]) + cfg.get("validation", {}).get("embargo_bars", 0)
     oos = df.iloc[cut:]
     delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
     allow_short = cfg["risk"].get("allow_short", False)
     sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int).iloc[cut:]
     m = bt.run(genome, oos, cfg, sig=sig)
-    return m["equity"].pct_change().fillna(0.0)
+    return m["returns"]
+
+
+def common_daily_returns(returns):
+    """Compound onto complete UTC days; do not invent zero returns for missing days."""
+    if returns.empty:
+        return returns
+    days = (1 + returns).resample("1D").prod(min_count=1) - 1
+    # Boundary days may be partial and distort cross-timeframe comparisons.
+    return days.iloc[1:-1].dropna()
 
 
 def _anti_clone(conn, cfg, data_by_key):
@@ -134,8 +157,8 @@ def _anti_clone(conn, cfg, data_by_key):
         if key not in data_by_key:
             continue
         try:
-            info[a["id"]] = (a["timeframe"],
-                             _oos_returns(json.loads(a["genome"]), data_by_key[key], cfg))
+            info[a["id"]] = common_daily_returns(
+                _oos_returns(json.loads(a["genome"]), data_by_key[key], cfg))
         except Exception:  # noqa
             continue
     if len(info) < 2:
@@ -150,14 +173,14 @@ def _anti_clone(conn, cfg, data_by_key):
     order = sorted(info.keys(), key=lambda i: score[i], reverse=True)
     kept, killed = [], 0
     for i in order:
-        tf_i, r_i = info[i]
+        r_i = info[i]
         clone = False
         for j in kept:
-            tf_j, r_j = info[j]
-            if tf_i != tf_j:
+            paired = pd.concat([r_i, info[j]], axis=1, join="inner").dropna()
+            if len(paired) < cfg["evolution"].get("correlation_min_days", 60):
                 continue
-            c = r_i.corr(r_j)
-            if pd.notna(c) and abs(c) > thresh:
+            c = paired.iloc[:, 0].corr(paired.iloc[:, 1])
+            if pd.notna(c) and c > thresh:
                 clone = True
                 break
         if clone:

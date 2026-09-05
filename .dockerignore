@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!requirements.lock
+!requirements.txt
+!config.yaml
+!main.py
+!daily_learn.py
+!paper_runner.py
+!cloud_runtime.py
+!dashboard.py
+!src/
+!src/*.py

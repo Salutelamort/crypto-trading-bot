@@ -14,6 +14,43 @@ import numpy as np
 import pandas as pd
 
 
+def return_statistics(returns):
+    """Unannualized moments for DSR; positive lag-1 dependence reduces sample size."""
+    values = np.asarray(returns, dtype=float)
+    if len(values) < 3 or not np.isfinite(values).all() or values.std(ddof=1) <= 0:
+        return None
+    centered = values - values.mean()
+    scale = np.sqrt(np.mean(centered ** 2))
+    lag = 0.0
+    if values[:-1].std() > 0 and values[1:].std() > 0:
+        lag = float(np.corrcoef(values[:-1], values[1:])[0, 1])
+    lag = max(0.0, min(lag, .99))
+    return {"n": len(values), "sr": float(values.mean() / values.std(ddof=1)),
+            "skew": float(np.mean((centered / scale) ** 3)),
+            "kurtosis": float(np.mean((centered / scale) ** 4)),
+            "effective_n": float(len(values) * (1 - lag) / (1 + lag))}
+
+
+def deflated_sharpe_probability(stats, reference_sr):
+    """Bailey/Lopez de Prado DSR with an explicit, unannualized search reference.
+
+    Effective sample size is a conservative AR(1) approximation, not a guarantee of
+    independence. Forward evaluation remains mandatory after this research gate.
+    """
+    if not stats or not math.isfinite(reference_sr):
+        return 0.0
+    try:
+        n, sr, skew, kurt = (float(stats[k]) for k in ("effective_n", "sr", "skew", "kurtosis"))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    if not all(math.isfinite(x) for x in (n, sr, skew, kurt)) or n < 30:
+        return 0.0
+    variance = 1 - skew * sr + (kurt - 1) * sr * sr / 4
+    if variance <= 0:
+        return 0.0
+    return NormalDist().cdf((sr - reference_sr) * math.sqrt(n - 1) / math.sqrt(variance))
+
+
 def expected_max_sharpe(trial_sharpes) -> float:
     """
     DEFLATED SHARPE (Bailey & López de Prado): ожидаемый МАКСИМАЛЬНЫЙ Sharpe, который
@@ -83,11 +120,12 @@ def compute_metrics(equity: pd.Series, returns: pd.Series,
     else:
         sortino = 0.0
 
-    total_return = float(equity.iloc[-1] / equity.iloc[0] - 1) if len(equity) else 0.0
+    initial_equity = float(equity.iloc[0] / (1 + r[0])) if len(equity) and len(r) and r[0] > -1 else 1.0
+    total_return = float(equity.iloc[-1] / initial_equity - 1) if len(equity) else 0.0
 
     # Максимальная просадка
     if len(equity):
-        running_max = equity.cummax()
+        running_max = equity.cummax().clip(lower=initial_equity)
         dd = (equity - running_max) / running_max
         max_drawdown = float(-dd.min())
     else:
@@ -97,7 +135,7 @@ def compute_metrics(equity: pd.Series, returns: pd.Series,
     # сколько доходности на единицу самой глубокой ямы.
     n = len(equity)
     if n and equity.iloc[0] > 0:
-        cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (ann / n) - 1)
+        cagr = float((equity.iloc[-1] / initial_equity) ** (ann / n) - 1)
     else:
         cagr = 0.0
     calmar = float(cagr / max_drawdown) if max_drawdown > 1e-9 else 0.0

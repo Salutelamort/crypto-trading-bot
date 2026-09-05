@@ -17,7 +17,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.lock
-      - run: python -m compileall -q src dashboard.py daily_learn.py main.py
+      - run: python -m compileall -q src dashboard.py daily_learn.py main.py paper_runner.py cloud_runtime.py
       - run: python -m ruff check . --exclude data --exclude TRACK_RECORD.csv
       - run: python -m unittest discover -s tests -p 'test_*.py' -v
       - run: python tests/golden_backtest.py

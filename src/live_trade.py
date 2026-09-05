@@ -7,7 +7,8 @@ import pandas as pd
 import requests
 
 from . import data_feed as feed
-from . import db, execution_report, macro_feed, news_feed, protections
+from . import db, execution_report, macro_feed, market_data, news_feed, protections
+from . import execution_core as core
 from . import genome as gn
 from . import indicators as ind
 from . import risk as rk
@@ -134,13 +135,7 @@ def _replay_minutes(pos, bars, until, risk_cfg):
         op, hi, lo, close = vals
         if not all(math.isfinite(x) and x > 0 for x in vals) or not lo <= min(op, close) <= max(op, close) <= hi:
             return None, "invalid_minute"
-        # A stop gapped through at the open fills at the worse opening price.
-        stop, take = pos._levels(risk_cfg)
-        if (pos.direction == 1 and op <= stop) or (pos.direction == -1 and op >= stop):
-            return ("stop", op, stamp.isoformat()), None
-        if (pos.direction == 1 and op >= take) or (pos.direction == -1 and op <= take):
-            return ("take_profit", take, stamp.isoformat()), None
-        exited, reason, price = pos.exit_check_hl(hi, lo, close, risk_cfg)
+        exited, reason, price = pos.exit_check_hl(hi, lo, close, risk_cfg, opened=op)
         if exited:
             # Exact intraminute fill time is unknown; stamp at the minute close.
             return (reason, price, (stamp + pd.Timedelta(minutes=1)).isoformat()), None
@@ -149,17 +144,66 @@ def _replay_minutes(pos, bars, until, risk_cfg):
     return (None, None) if cursor >= until else (None, "minute_gap")
 
 
-def tick(conn, cfg, verbose=True):
+def _collect_market(conn, cfg, book_provider=None):
+    """Network calls run before the account transaction; missing/raced data blocks entries."""
+    at = _utc(now_iso())
+    agents, _ = _active_agents(conn, cfg)
+    positions = _load_positions(conn)
+    pairs = {(a["symbol"], a["timeframe"]) for a in agents}
+    for pos in positions.values():
+        row = conn.execute("SELECT timeframe FROM agents WHERE id=?", (pos.agent_id,)).fetchone()
+        pairs.add((pos.symbol, pos.timeframe or (row[0] if row else cfg["timeframe"])))
+    result = {"at": at, "frames": {}, "minutes": {}, "books": {}, "macro": {}, "news": {}}
+    for sym, tf in sorted(pairs):
+        try:
+            result["frames"][(sym, tf)] = feed.fetch_recent(sym, tf, 400)
+        except FEED_ERRORS:
+            continue
+    for sym in {p.symbol for p in positions.values()}:
+        starts = [max(_utc(p.last_checked_at or p.opened_at).ceil("min"), _utc(p.opened_at).ceil("min"))
+                  for p in positions.values() if p.symbol == sym]
+        if min(starts) >= at.floor("min"):
+            continue
+        try:
+            result["minutes"][sym] = feed.fetch_since(
+                sym, "1m", int(min(starts).timestamp() * 1000),
+                end_ms=int(at.floor("min").timestamp() * 1000) - 1,
+                max_bars=int(cfg.get("live", {}).get("max_catchup_minutes", 10080)))
+        except FEED_ERRORS:
+            continue
+    mc = cfg.get("macro", {})
+    if mc.get("enabled"):
+        try:
+            result["macro"] = macro_feed.etf_flow_bias(mc.get("asset", "BTC"), mc.get("lookback_days", 5),
+                                                     mc.get("block_threshold_musd", 0))
+        except FEED_ERRORS:
+            result["macro"] = {"available": False, "bias": "unavailable"}
+    if cfg.get("news", {}).get("enabled"):
+        try:
+            result["news"] = news_feed.news_gate(cfg)
+        except FEED_ERRORS:
+            result["news"] = {"block": cfg["news"].get("fail_closed", False), "unavailable": True}
+    if cfg.get("execution", {}).get("use_order_book", False):
+        for sym in sorted({sym for sym, _ in pairs}):
+            try:
+                result["books"][sym] = (book_provider or market_data.rest_book)(sym)
+            except FEED_ERRORS:
+                continue
+    return result
+
+
+def tick(conn, cfg, verbose=True, *, book_provider=None):
     """Serialize paper writers and commit account, trades, positions and cursors together.
 
-    This dedicated connection must have no caller-owned transaction. SQLite readers can
-    continue during collection; another writer waits or fails before making changes.
+    This dedicated connection must have no caller-owned transaction. Network collection
+    precedes the short write transaction so learning and monitoring are not network-blocked.
     """
     if conn.in_transaction:
         raise RuntimeError("live tick requires a connection without a pending transaction")
+    observations = _collect_market(conn, cfg, book_provider)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        result = _tick(conn, cfg)
+        result = _tick(conn, cfg, observations)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -172,18 +216,19 @@ def tick(conn, cfg, verbose=True):
     return result
 
 
-def _tick(conn, cfg):
+def _tick(conn, cfg, observations):
     db.ensure_experiment(conn, cfg, commit=False)
     capital, peak = _init_account(conn, cfg, commit=False)
     risk_cfg = cfg["risk"]
     fee, slip = cfg["costs"]["fee_pct"], cfg["costs"]["slippage_pct"]
-    now = _utc(now_iso())
+    now = observations["at"]
     until = now.floor("min")
     agents, demo = _active_agents(conn, cfg)
     active = {a["id"]: a for a in agents}
     positions = _load_positions(conn)
     report = {"at": now.isoformat(), "demo": demo, "issues": [], "entry_reasons": {},
-              "quotes": {}, "position_gaps": {}, "partial_entry_minutes": 0}
+              "quotes": {}, "position_gaps": {}, "partial_entry_minutes": 0,
+              "books": {}, "model_version": core.MODEL_VERSION}
     reasons = report["entry_reasons"]
 
     # Baseline is explicit: older history may not contain every cash movement.
@@ -224,7 +269,7 @@ def _tick(conn, cfg):
     tolerance = cfg.get("live", {}).get("quote_grace_seconds", 120)
     for sym, tf in sorted(pairs):
         try:
-            frame = feed.fetch_recent(sym, tf, 400).sort_index()
+            frame = observations["frames"][(sym, tf)].sort_index()
             stamp = _utc(frame.index[-1])
             step = pd.Timedelta(milliseconds=feed._TF_MS[tf])
             age = max(0.0, (now - (stamp + step)).total_seconds())
@@ -241,6 +286,21 @@ def _tick(conn, cfg):
             report["quotes"].setdefault(sym + "/" + tf, {"available": False})
 
     minute_cache = {}
+    execution = cfg.get("execution", {})
+    books = {}
+    if execution.get("use_order_book", False):
+        for sym in {sym for sym, _ in pairs}:
+            book = observations["books"].get(sym)
+            age = time.time() - book["received_at"] if book else None
+            if (book is not None and 0 <= age <= execution.get("max_quote_age_seconds", 5)
+                    and book["latency_seconds"] <= execution.get("max_request_latency_seconds", 3)):
+                books[sym] = book
+                prices[sym] = (book["bid"] + book["ask"]) / 2
+                report["books"][sym] = {"available": True, "age_seconds": age,
+                    "source": book["source"], "spread_bps": (book["ask"] - book["bid"]) / prices[sym] * 10000}
+            else:
+                report["books"][sym] = {"available": False}
+                report["issues"].append(f"book_unavailable:{sym}")
     max_minutes = int(cfg.get("live", {}).get("max_catchup_minutes", 10080))
     for sym in sorted({p.symbol for p in positions.values()}):
         cursors = [max(_utc(p.last_checked_at or p.opened_at).ceil("min"),
@@ -250,9 +310,7 @@ def _tick(conn, cfg):
             minute_cache[sym] = None
             continue
         try:
-            minute_cache[sym] = feed.fetch_since(sym, "1m", int(start.timestamp() * 1000),
-                                                 end_ms=int(until.timestamp() * 1000) - 1,
-                                                 max_bars=max_minutes)
+            minute_cache[sym] = observations["minutes"][sym]
         except FEED_ERRORS:
             minute_cache[sym] = None
         if (until - start).total_seconds() > max_minutes * 60:
@@ -262,7 +320,12 @@ def _tick(conn, cfg):
 
     def close_position(pos, reason, price, stamp):
         nonlocal capital
-        fill = price * (1 - slip * pos.direction)
+        current_exit = _utc(stamp) >= now
+        quote = books.get(pos.symbol) if current_exit else None
+        exit_slip = slip
+        if execution.get("use_order_book", False) and quote is None:
+            exit_slip += execution.get("replay_spread_bps", 10) / 20000
+        fill = core.fill_price(price, -pos.direction, exit_slip, quote=quote)
         settlement = rk.close_pnl(pos, fill, fee)
         net = settlement
         if pos.entry_fee_paid:
@@ -279,6 +342,12 @@ def _tick(conn, cfg):
         closed_ids.add(pos.agent_id)
         # Same strategy must not re-enter on another tick of this signal bar.
         db.set_runtime_state(conn, f"last_exit:{pos.agent_id}", now.isoformat(), commit=False)
+        agent = position_agents.get(pos.agent_id)
+        genome = json.loads(agent["genome"]) if agent else {}
+        step = feed._TF_MS.get(pos.timeframe, 3_600_000)
+        bar_ms = int(now.timestamp() * 1000) // step * step
+        resume = pd.Timestamp(bar_ms + core.cooldown_bars(genome) * step, unit="ms", tz="UTC")
+        db.set_runtime_state(conn, f"cooldown_until:{pos.agent_id}", resume.isoformat(), commit=False)
 
     # Exits precede entries, and do not depend on an agent being promoted.
     for aid, pos in list(positions.items()):
@@ -290,7 +359,7 @@ def _tick(conn, cfg):
             continue
         frame = data.get((pos.symbol, pos.timeframe))
         if frame is not None:
-            price = float(frame["close"].iloc[-1])
+            price = prices.get(pos.symbol, float(frame["close"].iloc[-1]))
             pos.mark_price, pos.mark_at = price, now.isoformat()
             # Current observation can still trigger protection when minute history fails.
             # Do not advance the trailing extreme ahead of the replay cursor.
@@ -329,6 +398,10 @@ def _tick(conn, cfg):
         return capital + sum(p.value(prices.get(p.symbol, p.mark_price)) for p in positions.values())
 
     blocks = []
+    if cfg.get("runner", {}).get("require_candidate_snapshot", False) and db.get_runtime_state(conn, "candidate_snapshot_ok") != "1":
+        blocks.append("candidate_snapshot_unavailable")
+    if any(not value["available"] for value in report["books"].values()):
+        blocks.append("book_unavailable")
     reconciliation = execution_report.cash_reconciliation(conn)
     if reconciliation.get("available"):
         # In-memory cash already includes this tick's fills; compare the ledger to it.
@@ -341,8 +414,7 @@ def _tick(conn, cfg):
     mc = cfg.get("macro", {})
     if mc.get("enabled"):
         try:
-            info = macro_feed.etf_flow_bias(mc.get("asset", "BTC"), mc.get("lookback_days", 5),
-                                           mc.get("block_threshold_musd", 0))
+            info = observations["macro"]
             if info["bias"] == "risk_off" or (not info.get("available", False) and mc.get("fail_closed", False)):
                 blocks.append("macro")
             if not info.get("available", False):
@@ -353,8 +425,10 @@ def _tick(conn, cfg):
                 blocks.append("macro")
     if cfg.get("news", {}).get("enabled"):
         try:
-            if news_feed.news_gate(cfg)["block"]:
+            if observations["news"]["block"]:
                 blocks.append("news")
+            if observations["news"].get("unavailable"):
+                report["issues"].append("news_unavailable")
         except FEED_ERRORS:
             report["issues"].append("news_unavailable")
             if cfg["news"].get("fail_closed", False):
@@ -376,6 +450,7 @@ def _tick(conn, cfg):
             frame = data[(sym, tf)]
             bar_at = _utc(frame.index[-1])
             last_exit = db.get_runtime_state(conn, f"last_exit:{aid}")
+            resume = db.get_runtime_state(conn, f"cooldown_until:{aid}")
             g = json.loads(a["genome"])
             signal = int(gn.signal(g, frame, risk_cfg.get("allow_short", False)).shift(
                 cfg.get("execution", {}).get("signal_delay_bars", 1)).fillna(0).iloc[-1])
@@ -384,6 +459,8 @@ def _tick(conn, cfg):
             dd = (peak - eq) / peak if peak else 0.0
             if last_exit and _utc(last_exit) >= bar_at:
                 reason = "closed_this_bar"
+            elif resume and now < _utc(resume):
+                reason = "cooldown"
             elif signal == 0:
                 reason = "no_signal"
             elif blocks:
@@ -406,15 +483,33 @@ def _tick(conn, cfg):
                     if g.get("stop_atr"):
                         effective["atr_stop_mult"] = g["stop_atr"]
                     invest = min(rk.position_size(capital, effective, atr, price), capital / (1 + fee))
+                    gross = sum(p.notional for p in positions.values())
+                    gross_capacity = eq * risk_cfg.get("max_gross_fraction", 1.0) - gross
+                    invest = min(invest, max(0, gross_capacity))
                     if invest <= 0 or not math.isfinite(invest):
                         reason = "insufficient_cash"
                     else:
-                        fill = price * (1 + slip * signal)
+                        book = books.get(sym)
+                        if book:
+                            available_qty = book["ask_qty" if signal == 1 else "bid_qty"]
+                            invest = min(invest, available_qty * price * execution.get("book_participation", .1))
+                        try:
+                            fill = core.fill_price(price, signal, slip, quote=book,
+                                                   max_spread=execution.get("max_spread_bps", 20) / 10000)
+                        except ValueError:
+                            reasons["spread_limit"] = reasons.get("spread_limit", 0) + 1
+                            continue
                         rr = risk_cfg.get("fixed_rr", g.get("rr"))
-                        take = g["stop_atr"] * rr if g.get("stop_atr") and rr else None
+                        take = round(g["stop_atr"] * rr, 3) if g.get("stop_atr") and rr else None
                         p = rk.Position(aid, sym, fill, invest / fill, direction=signal,
                                         notional=invest, atr=atr, stop_mult=g.get("stop_atr"),
                                         take_mult=take, trail_mult=g.get("trail_atr"), entry_fee_paid=True)
+                        open_risk = sum(max(0, q.direction * (q.mark_price - q._levels(q.risk_snapshot)[0])) * q.units
+                                        for q in positions.values())
+                        new_risk = max(0, signal * (fill - p._levels(risk_cfg)[0])) * p.units + 2 * invest * fee
+                        if open_risk + new_risk > eq * risk_cfg.get("max_total_stop_risk", 1.0):
+                            reasons["portfolio_risk_limit"] = reasons.get("portfolio_risk_limit", 0) + 1
+                            continue
                         # Record actual entry time, after all network collection.
                         p.opened_at = now_iso()
                         p.last_checked_at = _utc(p.opened_at).ceil("min").isoformat()
@@ -435,6 +530,21 @@ def _tick(conn, cfg):
     _save_account(conn, capital, peak, commit=False)
     db.set_runtime_state(conn, "last_tick_at", now.isoformat(), commit=False)
     report.update(equity=eq, cash=capital, open_positions=len(positions), entry_blocks=blocks)
+    previous = db.get_runtime_state(conn, "previous_sample_at")
+    interval = (now - _utc(previous)).total_seconds() if previous else None
+    optional_issues = set()
+    if not cfg.get("macro", {}).get("fail_closed", False):
+        optional_issues.add("macro_unavailable")
+    if not cfg.get("news", {}).get("fail_closed", False):
+        optional_issues.add("news_unavailable")
+    quality = not (set(report["issues"]) - optional_issues or report["position_gaps"] or "data_unavailable" in blocks)
+    if interval is not None and interval > cfg.get("readiness", {}).get("max_tick_gap_seconds", 180):
+        quality = False
+        report["issues"].append("tick_gap")
+    exp = db.get_runtime_state(conn, "current_experiment")
+    conn.execute("INSERT OR IGNORE INTO equity_samples VALUES(?,?,?,?,?,?)",
+                 (exp, now.isoformat(), eq, capital, int(quality), interval))
+    db.set_runtime_state(conn, "previous_sample_at", now.isoformat(), commit=False)
     db.set_runtime_state(conn, "execution_health", json.dumps(report, ensure_ascii=False), commit=False)
     return report
 

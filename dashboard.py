@@ -111,7 +111,7 @@ def _status_payload():
         return _status_from_connection(conn)
 
 
-def _status_from_connection(conn):
+def _status_from_connection(conn, *, external_data=True):
     out = {"counts": {}, "agents": [], "decisions": [], "trades": [], "paper": {}}
     for st in ("candidate", "promoted", "killed"):
         out["counts"][st] = len(db.get_agents(conn, st))
@@ -167,8 +167,8 @@ def _status_from_connection(conn):
                    "drawdown": round(equity / peak - 1, 4) if peak else 0,
                    "open_positions": len(positions)}
 
-    out["macro"] = _macro()
-    out["news"] = _news()
+    out["macro"] = _macro() if external_data else {}
+    out["news"] = _news() if external_data else {"unavailable": True}
     out["sync"] = {"status": SYNC["status"], "last_ok": SYNC["last_ok"]}
     return out
 
@@ -246,6 +246,13 @@ tr:last-child td{border-bottom:none}
 </div>
 
 <div class="cards" id="cards"></div>
+
+<div class="panel">
+  <h2>Независимые виртуальные испытания</h2>
+  <div class="mut">Стратегия и настройки фиксируются на старте каждого отдельного счёта.
+    Реальные ордера отключены. Результаты этих счетов не прибавляются к основному балансу.</div>
+  <div id="forward-trials" style="margin-top:12px;white-space:pre-wrap"></div>
+</div>
 
 <div class="panel">
   <h2>Качество эксперимента</h2>
@@ -326,8 +333,8 @@ async function refresh(){
   $('#sync').innerHTML='<span class="dot"></span>'+(sy.status||'—')+(sy.last_ok?(' · последняя синхронизация '+sy.last_ok):'');
   $('#macro').innerHTML='<span class="badge '+(m.bias||'neutral')+'">ETF: '+(m.bias||'—')+
     '</span> <span class="mut">'+(m.note||'')+'</span>';
-  const ncls=nw.block?'risk_off':'risk_on';
-  $('#news').innerHTML='<span class="badge '+ncls+'">Новости: '+(nw.block?'входы стоп':'спокойно')+
+  const ncls=nw.unavailable?'neutral':(nw.block?'risk_off':'risk_on');
+  $('#news').innerHTML='<span class="badge '+ncls+'">Новости: '+(nw.unavailable?'нет данных':(nw.block?'входы стоп':'спокойно'))+
     '</span> <span class="mut">F&amp;G '+(fng.value??'—')+' '+(fng.label||'')+'</span>';
 
   const cap=d.live.equity,start=d.paper.start_capital,ret=cap/start-1;
@@ -345,6 +352,8 @@ async function refresh(){
   const ex=d.experiment||{}, health=ex.health||{}, rec=ex.reconciliation||{};
   const escapeText=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const labels={position_open:'позиция уже открыта',closed_this_tick:'закрыто на этом тике',
+    cooldown:'пауза после выхода',candidate_snapshot_unavailable:'ожидание свежего отбора стратегий',
+    spread_limit:'слишком широкий спред',portfolio_risk_limit:'лимит суммарного риска',
     closed_this_bar:'закрыто на этой свече',quote_unavailable:'нет свежей котировки',
     no_signal:'нет сигнала',data_unavailable:'неполные рыночные данные',ledger_mismatch:'расхождение учёта',macro:'макро-фильтр',
     news:'новостной фильтр',stoploss_guard:'серия убытков',drawdown:'лимит просадки',
@@ -362,6 +371,14 @@ async function refresh(){
   const gaps=Object.entries(health.position_gaps||{}).map(([k,v])=>'Позиция #'+k+': '+v).join(' · ');
   $('#execution-health').textContent=[freshness,reconciliation,entries,quotes,gaps,
     (health.issues||[]).join(' · ')].filter(Boolean).join('\n');
+  $('#forward-trials').textContent=(d.forward_trials||[]).map(t=>{
+    const e=t.evidence||{};
+    return t.genome.symbol+' / '+t.genome.timeframe+' · '+t.genome.type+
+      '\nНаблюдение: '+num(e.days,1)+' дней · закрыто: '+(e.closed_trades||0)+
+      ' · доходность: '+num(100*e.total_return)+'% · просадка: '+num(100*e.max_drawdown)+'%'+
+      '\n'+(t.status!=='active'?'Испытание завершено после смены версии':
+        (e.status==='eligible_for_human_review'?'Критерии выполнены для ручного рассмотрения':'Сбор данных / критерии пока не выполнены'));
+  }).join('\n\n')||'Пока нет подходящих кандидатов для отдельного испытания.';
   $('#cohorts').innerHTML=(ex.cohorts||[]).map(c=>`<tr>
     <td style="max-width:350px;overflow-wrap:anywhere">${escapeText(c.experiment_id)}</td>
     <td>${escapeText(c.mode)}</td><td>${c.closed_trades}</td><td>${c.unknown_pnl_trades}</td>

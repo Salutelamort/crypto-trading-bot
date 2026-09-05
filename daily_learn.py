@@ -11,6 +11,7 @@
 непрерывно. За 3 месяца накапливается forward-track-record на невиданных данных.
 По нему ЧЕЛОВЕК потом решает про реальные деньги. Автоперехода НЕТ — мера безопасности.
 """
+import argparse
 import csv
 import datetime
 import json
@@ -19,8 +20,8 @@ import time
 
 import yaml
 
-from src import data_feed as feed
 from src import (
+    candidate_exchange,
     db,
     evolution,
     execution_report,
@@ -29,6 +30,7 @@ from src import (
     news_feed,
     supervisor,
 )
+from src import data_feed as feed
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",
@@ -89,8 +91,17 @@ def _journal(conn, cfg):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--research-only", action="store_true")
+    parser.add_argument("--db-path")
+    parser.add_argument("--candidate-path", default="state/candidates.json")
+    args = parser.parse_args()
     with open("config.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+    if args.research_only:
+        cfg["db_path"] = "data/research.db"
+    if args.db_path:
+        cfg["db_path"] = args.db_path
     conn = db.connect(cfg["db_path"])
 
     # бюджет времени на один облачный прогон (минут). Репо публичный → минуты
@@ -117,9 +128,12 @@ def main():
     # момент допуска), затем отбор с демоцией + один тик бумажной торговли.
     evolution.reevaluate_promoted(conn, cfg, data)
     supervisor.supervise(conn, cfg)
-    live_trade.tick(conn, cfg)
-    snapshot = _journal(conn, cfg)
-    _write_state_summary(conn, cfg, cycles, snapshot)
+    if args.research_only:
+        candidate_exchange.export_snapshot(conn, cfg, args.candidate_path)
+    else:
+        live_trade.tick(conn, cfg)
+        snapshot = _journal(conn, cfg)
+        _write_state_summary(conn, cfg, cycles, snapshot)
     print(f"\nГотово: циклов эволюции за прогон — {cycles}")
 
     # RETENTION — база теперь хранится сжатым release-asset, не в git-истории:

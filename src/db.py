@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 SCHEMA = """
 -- Агенты = торговые стратегии с конкретными параметрами (геном).
@@ -111,6 +112,27 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS equity_samples (
+    experiment_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    equity REAL NOT NULL,
+    cash REAL NOT NULL,
+    quality_ok INTEGER NOT NULL,
+    interval_seconds REAL,
+    PRIMARY KEY(experiment_id, ts)
+);
+
+CREATE TABLE IF NOT EXISTS forward_trials (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    genome_json TEXT NOT NULL,
+    ledger BLOB NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+
 -- Неизменяемая метка форвард-когорты: код и конфигурация, которыми открыты сделки.
 CREATE TABLE IF NOT EXISTS experiments (
     id          TEXT PRIMARY KEY,
@@ -160,6 +182,10 @@ def _migrate(conn):
     for col in ("test_buyhold", "test_alpha", "test_sortino", "test_calmar", "test_pf"):
         if col not in cols:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} REAL")
+    for col, spec in (("return_stats", "TEXT"), ("model_version", "TEXT"),
+                      ("stress_return", "REAL"), ("stress_pf", "REAL")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {spec}")
     pcols = {r["name"] for r in conn.execute("PRAGMA table_info(live_positions)").fetchall()}
     if "direction" not in pcols:
         conn.execute("ALTER TABLE live_positions ADD COLUMN direction INTEGER DEFAULT 1")
@@ -217,26 +243,16 @@ def _code_sha():
 
 
 def _source_hash():
-    """Стабильный fingerprint логики; auto-коммиты CSV/state его не меняют."""
-    try:
-        listed = subprocess.run(
-            ["git", "ls-files"], capture_output=True, text=True,
-            check=True, timeout=3,
-        ).stdout.splitlines()
-        relevant = sorted(
-            p for p in listed
-            if ((p.startswith("src/") and p.endswith(".py"))
-                or p in {"main.py", "daily_learn.py", "config.yaml",
-                         "requirements.txt", "requirements.lock"})
-        )
-        digest = hashlib.sha256()
-        for path in relevant:
-            digest.update(path.encode("utf-8") + b"\0")
-            with open(path, "rb") as f:
-                digest.update(f.read())
-        return digest.hexdigest()[:16]
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+    """Fingerprint source files, including new untracked modules; ignore line-ending differences."""
+    root = Path(__file__).resolve().parents[1]
+    relevant = list((root / "src").glob("*.py"))
+    relevant += [root / name for name in ("main.py", "daily_learn.py", "paper_runner.py", "cloud_runtime.py", "config.yaml",
+                                         "requirements.txt", "requirements.lock") if (root / name).exists()]
+    digest = hashlib.sha256()
+    for path in sorted(relevant):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()[:16]
 
 
 def ensure_experiment(conn, cfg, *, commit=True):
@@ -297,6 +313,9 @@ def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consisten
     # Сворачиваем испытание в компактную память (один агент = одно испытание).
     # count_trial=False — при ПЕРЕОЦЕНКЕ уже существующего агента (не новое
     # испытание, счётчик Deflated Sharpe раздувать нельзя).
+    conn.execute("UPDATE agents SET return_stats=?,model_version=?,stress_return=?,stress_pf=? WHERE id=?",
+                 (json.dumps(test.get("return_stats")), test.get("model_version"),
+                  test.get("stress_return"), test.get("stress_pf"), agent_id))
     row = conn.execute("SELECT genome, symbol, timeframe FROM agents WHERE id=?",
                        (agent_id,)).fetchone()
     if row is not None and count_trial:

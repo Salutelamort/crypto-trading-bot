@@ -39,6 +39,9 @@ def synthetic_df(n=2500, seed=42):
     high = close * (1 + spread)
     low = close * (1 - spread)
     openp = close * (1 + rng.normal(0, 0.003, len(close)))
+    # Valid OHLC bounds are required now that opening gaps affect execution.
+    high = np.maximum(high, openp)
+    low = np.minimum(low, openp)
     vol = np.abs(rng.normal(1000, 200, len(close)))
     idx = pd.date_range("2022-01-01", periods=len(close), freq="4h", tz="UTC")
     return pd.DataFrame({"open": openp, "high": high, "low": low,

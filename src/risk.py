@@ -8,6 +8,8 @@
 """
 import math
 
+from . import execution_core as core
+
 
 class Position:
     """
@@ -43,29 +45,18 @@ class Position:
 
     def _levels(self, risk_cfg):
         """Абсолютные (effective_stop, take) с учётом направления и ATR/процентов."""
-        e = self.entry_price
-        use_atr = risk_cfg.get("atr_stop") and self.atr and self.atr > 0
-        if use_atr:
-            sm = self.stop_mult if self.stop_mult else risk_cfg.get("atr_stop_mult", 2.0)
-            tm = self.take_mult if self.take_mult else risk_cfg.get("atr_take_mult", 6.0)
-            trm = self.trail_mult if self.trail_mult else risk_cfg.get("atr_trail_mult", 2.5)
-            s_off = sm * self.atr
-            t_off = tm * self.atr
-            tr_off = trm * self.atr
-        else:
-            s_off = e * risk_cfg["stop_loss_pct"]
-            t_off = e * risk_cfg["take_profit_pct"]
-            tr_off = self.peak_price * risk_cfg["trailing_stop_pct"]
-        if self.direction == 1:
-            return max(e - s_off, self.peak_price - tr_off), e + t_off
-        else:
-            return min(e + s_off, self.peak_price + tr_off), e - t_off
+        effective = dict(risk_cfg)
+        for value, name in ((self.stop_mult, "atr_stop_mult"), (self.take_mult, "atr_take_mult"),
+                            (self.trail_mult, "atr_trail_mult")):
+            if value is not None:
+                effective[name] = value
+        return core.exit_levels(self.direction, self.entry_price, self.peak_price, self.atr, effective)
 
     def value(self, price):
         """Текущая стоимость позиции (mark-to-market) для расчёта капитала."""
         return self.notional * (1 + self.direction * (price / self.entry_price - 1))
 
-    def exit_check_hl(self, high, low, price, risk_cfg):
+    def exit_check_hl(self, high, low, price, risk_cfg, opened=None):
         """
         Внутрибарная проверка по экстремумам — для живого режима, чтобы стоп
         срабатывал между тиками как настоящий резервный ордер.
@@ -75,16 +66,10 @@ class Position:
         # свечи мог бы подтянуть trailing-stop, а более ранний low той же свечи —
         # тут же его исполнить: порядок событий внутри OHLC неизвестен.
         eff_stop, take = self._levels(risk_cfg)
-        if self.direction == 1:
-            if low <= eff_stop:
-                return True, "stop", eff_stop
-            if high >= take:
-                return True, "take_profit", take
-        else:
-            if high >= eff_stop:
-                return True, "stop", eff_stop
-            if low <= take:
-                return True, "take_profit", take
+        result = core.protective_exit(self.direction, eff_stop, take, high, low, opened)
+        if result:
+            reason, exit_price = result
+            return True, reason, exit_price
         self.update_extreme(high, low)
         return False, None, price
 

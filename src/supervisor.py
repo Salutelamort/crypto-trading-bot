@@ -17,10 +17,20 @@
   - Карантин символов и продвижение по validation с финальной live-проверкой.
 """
 import json
+import math
 
 from . import db
+from . import execution_core as core
 from . import genome as gn
 from . import metrics as mt
+
+
+def _number(value, default):
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 def _agent_summary(a: dict) -> dict:
@@ -45,8 +55,8 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
         family_sr0 = sr0.get(family, 0.0) if isinstance(sr0, dict) else sr0
         sharpe_bar = max(sup["promote_min_sharpe"], family_sr0)
         s = _agent_summary(a)
-        ts = s["test_sharpe"] or -99
-        dd = s["test_maxdd"] or 1.0
+        ts = _number(s["test_sharpe"], -99)
+        dd = _number(s["test_maxdd"], 1.0)
         cons = s["consistency"] or 0.0
         trades = s["test_trades"] or 0
         alpha = a["test_alpha"] if a["test_alpha"] is not None else -99
@@ -69,22 +79,35 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
                    and ts > 0
                    and pf >= sup.get("promote_min_pf", 1.1)
                    and a["symbol"] not in quarantined)
-        # Достаточно ЛИБО хорошего Sharpe (гладкая кривая), ЛИБО обгона рынка (alpha),
-        # ЛИБО высокого Calmar (доход на единицу просадки — профиль низкого риска).
-        edge_ok = (ts >= sharpe_bar
-                   or alpha >= sup.get("promote_min_alpha", 99)
-                   or calmar >= sup.get("promote_min_calmar", 99))
+        # Sharpe and DSR are mandatory; diagnostic alpha/Calmar cannot bypass them.
+        stats = a.get("return_stats")
+        if isinstance(stats, str):
+            try:
+                stats = json.loads(stats)
+            except ValueError:
+                stats = None
+        reference = max(0.0, family_sr0) / math.sqrt(mt.PERIODS_PER_YEAR.get(a["timeframe"], 8760))
+        probability = mt.deflated_sharpe_probability(stats, reference)
+        edge_ok = ts >= sharpe_bar
+        if sup.get("deflated_sharpe_enabled", True):
+            edge_ok = edge_ok and probability >= sup.get("min_dsr_probability", .95)
+        if sup.get("require_current_model", False):
+            edge_ok = edge_ok and a.get("model_version") == core.MODEL_VERSION
+        if sup.get("require_cost_stress", False):
+            edge_ok = (edge_ok and _number(a.get("stress_return"), -1) > 0
+                       and _number(a.get("stress_pf"), 0) >= sup.get("stress_min_pf", 1.05))
         if base_ok and edge_ok:
             decisions.append((a["id"], "promote",
                 (f"Validation Sharpe {ts:.2f}, Calmar {calmar:.2f}, PF {pf:.2f}, "
                  f"alpha {alpha:+.1%}, просадка {dd:.0%}, сделок {trades}, "
-                 f"устойчивость {cons:.0%} — допущен")))
+                 f"устойчивость {cons:.0%}, DSR {probability:.1%} — допущен в демо")))
         else:
             invalid = f", невалидный геном: {invalid_reason}" if not valid else ""
             decisions.append((a["id"], "hold",
                 (f"не дотягивает (Sharpe {ts:.2f}, Calmar {calmar:.2f}, "
                  f"alpha {alpha:+.1%}, PF {pf:.2f}, просадка {dd:.0%}, "
-                 f"trades {trades}, устойчивость {cons:.0%}{invalid})")))
+                 f"trades {trades}, устойчивость {cons:.0%}, DSR {probability:.1%}, "
+                 f"stress={a.get('stress_return')}{invalid})")))
     return decisions
 
 
@@ -163,9 +186,6 @@ def supervise(conn, cfg):
     """Стадия отбора эволюции: продвигает достойных, убивает слабых."""
     quarantined = db.quarantined_symbols(conn)
     agents = db.get_agents(conn, "candidate")
-    if not agents:
-        print("Нет агентов-кандидатов. Сначала запусти эволюцию.")
-        return {"kill": 0, "promote": 0, "hold": 0}
 
     # Deflated Sharpe: планка "лучшего по удаче" из РАСПРЕДЕЛЕНИЯ Sharpe всех испытаний
     # (всех когда-либо оценённых агентов), чтобы не поверить везунчику среди тысяч.
@@ -174,7 +194,8 @@ def supervise(conn, cfg):
         # Коррелированные поиски разных типов/рынков нельзя считать миллионами
         # независимых ставок. Считаем SR0 отдельно в каждой семье.
         family_stats = db.trial_family_stats(conn)
-        sr0 = {family: mt.expected_max_sharpe_from_stats(n, sigma)
+        total_trials = sum(n for n, _ in family_stats.values())
+        sr0 = {family: mt.expected_max_sharpe_from_stats(max(n, total_trials), sigma)
                for family, (n, sigma) in family_stats.items()}
         bars = list(sr0.values())
         print(f"  Deflated Sharpe: семейных планок {len(bars)}, "

@@ -38,6 +38,7 @@ pytz==2026.3.post1
 pyyaml==6.0.3
     # via -r requirements.txt
 requests==2.34.2
+websocket-client==1.9.2
     # via -r requirements.txt
 ruff==0.16.5
     # via -r requirements.txt

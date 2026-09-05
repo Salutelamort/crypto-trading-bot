@@ -114,7 +114,8 @@ def run_paper(conn, cfg, data_by_key):
             if pos is not None:
                 high = float(s["df"].loc[ts, "high"])
                 low = float(s["df"].loc[ts, "low"])
-                should_exit, reason, exit_price = pos.exit_check_hl(high, low, price, risk_cfg)
+                should_exit, reason, exit_price = pos.exit_check_hl(
+                    high, low, price, risk_cfg, opened=float(s["df"].loc[ts, "open"]))
                 if not should_exit and sig_now != pos.direction:
                     should_exit, reason, exit_price = True, "signal", price
                 if should_exit:
@@ -155,7 +156,7 @@ def run_paper(conn, cfg, data_by_key):
                 fill = price * (1 + slip * sig_now)
                 units = invest / fill
                 rr = risk_cfg.get("fixed_rr", g.get("rr"))
-                take_mult = (g["stop_atr"] * rr) if g.get("stop_atr") and rr else None
+                take_mult = round(g["stop_atr"] * rr, 3) if g.get("stop_atr") and rr else None
                 entry_fee = invest * fee
                 capital -= invest + entry_fee
                 open_positions[aid] = rk.Position(
