@@ -1,11 +1,54 @@
 {
-  "updated_at": "2026-09-05T04:44:03.840140+00:00",
-  "experiment_id": "audit-v2:744bd14e91b827e5:cce0bb77a79bdc07",
-  "equity": 9944.8,
+  "updated_at": "2026-09-05T05:34:49.554334+00:00",
+  "experiment_id": "audit-v3:16d052384790871d:dae4f60d1b0ebc87",
+  "equity": 9945.07,
   "free_cash": 9425.92,
   "open_positions": 1,
   "candidates": 5,
   "promoted": 1,
   "best_test_sharpe": 8.969,
-  "cycles": 20
+  "cycles": 23,
+  "execution_health": {
+    "at": "2026-09-05T05:34:46.676570+00:00",
+    "demo": false,
+    "issues": [
+      "legacy_risk_snapshot:2819245",
+      "macro_unavailable"
+    ],
+    "entry_reasons": {
+      "position_open": 1
+    },
+    "quotes": {
+      "ADAUSDT/1d": {
+        "bar_at": "2026-09-05T00:00:00+00:00",
+        "age_seconds": 0.0,
+        "available": true
+      }
+    },
+    "position_gaps": {},
+    "partial_entry_minutes": 1,
+    "equity": 9945.07092106757,
+    "cash": 9425.915749808008,
+    "open_positions": 1,
+    "entry_blocks": [],
+    "age_seconds": 2.877752
+  },
+  "experiment_metrics": {
+    "closed_trades": 0,
+    "known_pnl_trades": 0,
+    "unknown_pnl_trades": 0,
+    "realized_pnl": 0,
+    "win_rate": null,
+    "profit_factor": null,
+    "mean_pnl": null
+  },
+  "cash_reconciliation": {
+    "available": true,
+    "since": "2026-09-05T05:34:46.676570+00:00",
+    "expected_cash": 9425.915749808008,
+    "actual_cash": 9425.915749808008,
+    "difference": 0.0,
+    "untracked_trades": 0,
+    "ok": true
+  }
 }
