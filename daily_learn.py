@@ -20,7 +20,15 @@ import time
 import yaml
 
 from src import data_feed as feed
-from src import db, evolution, live_trade, macro_feed, news_feed, supervisor, execution_report
+from src import (
+    db,
+    evolution,
+    execution_report,
+    live_trade,
+    macro_feed,
+    news_feed,
+    supervisor,
+)
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",

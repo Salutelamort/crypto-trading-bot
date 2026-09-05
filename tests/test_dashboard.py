@@ -38,8 +38,8 @@ class DashboardTests(unittest.TestCase):
     def test_rendered_dashboard_javascript_parses(self):
         response = dashboard.app.test_client().get("/")
         self.assertEqual(response.status_code, 200)
-        script = re.search(r"<script>(.*?)</script>", response.get_data(as_text=True), re.S).group(1)
-        result = subprocess.run(["node", "--check"], input=script, text=True,
+        script = re.search(r"<script>(.*?)</script>", response.get_data(as_text=True), re.DOTALL).group(1)
+        result = subprocess.run(["node", "--check"], check=False, input=script, text=True,
                                 capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 

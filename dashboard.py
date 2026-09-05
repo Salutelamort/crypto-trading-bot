@@ -23,7 +23,7 @@ import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-from src import db, macro_feed, news_feed, execution_report
+from src import db, execution_report, macro_feed, news_feed
 
 app = Flask(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))

@@ -4,13 +4,17 @@ import math
 import time
 
 import pandas as pd
+import requests
 
 from . import data_feed as feed
-from . import db, macro_feed, news_feed, protections, execution_report
+from . import db, execution_report, macro_feed, news_feed, protections
 from . import genome as gn
 from . import indicators as ind
 from . import risk as rk
 from .db import now_iso
+
+FEED_ERRORS = (requests.RequestException, OSError, RuntimeError, ValueError,
+               KeyError, IndexError, TypeError)
 
 
 def _utc(value):
@@ -232,7 +236,7 @@ def _tick(conn, cfg):
                 raise ValueError("stale or invalid quote")
             data[(sym, tf)] = frame
             prices[sym] = price
-        except Exception as exc:
+        except FEED_ERRORS as exc:
             report["issues"].append(f"quote_unavailable:{sym}/{tf}:{type(exc).__name__}")
             report["quotes"].setdefault(sym + "/" + tf, {"available": False})
 
@@ -249,7 +253,7 @@ def _tick(conn, cfg):
             minute_cache[sym] = feed.fetch_since(sym, "1m", int(start.timestamp() * 1000),
                                                  end_ms=int(until.timestamp() * 1000) - 1,
                                                  max_bars=max_minutes)
-        except Exception:
+        except FEED_ERRORS:
             minute_cache[sym] = None
         if (until - start).total_seconds() > max_minutes * 60:
             report["issues"].append(f"catchup_truncated:{sym}")
@@ -343,7 +347,7 @@ def _tick(conn, cfg):
                 blocks.append("macro")
             if not info.get("available", False):
                 report["issues"].append("macro_unavailable")
-        except Exception:
+        except FEED_ERRORS:
             report["issues"].append("macro_unavailable")
             if mc.get("fail_closed", False):
                 blocks.append("macro")
@@ -351,7 +355,7 @@ def _tick(conn, cfg):
         try:
             if news_feed.news_gate(cfg)["block"]:
                 blocks.append("news")
-        except Exception:
+        except FEED_ERRORS:
             report["issues"].append("news_unavailable")
             if cfg["news"].get("fail_closed", False):
                 blocks.append("news")

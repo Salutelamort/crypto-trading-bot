@@ -10,7 +10,6 @@ import pandas as pd
 
 from src import db, execution_report, live_trade, paper_trade, protections, risk
 
-
 NOW = "2026-09-05T12:05:30+00:00"
 
 
