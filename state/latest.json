@@ -1,18 +1,17 @@
 {
-  "updated_at": "2026-09-05T05:34:49.554334+00:00",
+  "updated_at": "2026-09-05T08:44:17.383323+00:00",
   "experiment_id": "audit-v3:16d052384790871d:dae4f60d1b0ebc87",
-  "equity": 9945.07,
+  "equity": 9938.76,
   "free_cash": 9425.92,
   "open_positions": 1,
-  "candidates": 5,
+  "candidates": 6,
   "promoted": 1,
   "best_test_sharpe": 8.969,
-  "cycles": 23,
+  "cycles": 21,
   "execution_health": {
-    "at": "2026-09-05T05:34:46.676570+00:00",
+    "at": "2026-09-05T08:44:13.930427+00:00",
     "demo": false,
     "issues": [
-      "legacy_risk_snapshot:2819245",
       "macro_unavailable"
     ],
     "entry_reasons": {
@@ -27,11 +26,11 @@
     },
     "position_gaps": {},
     "partial_entry_minutes": 1,
-    "equity": 9945.07092106757,
+    "equity": 9938.485439727343,
     "cash": 9425.915749808008,
     "open_positions": 1,
     "entry_blocks": [],
-    "age_seconds": 2.877752
+    "age_seconds": 3.452881
   },
   "experiment_metrics": {
     "closed_trades": 0,
