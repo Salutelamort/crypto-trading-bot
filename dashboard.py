@@ -17,12 +17,13 @@ import tarfile
 import tempfile
 import threading
 import time
+from contextlib import closing
 
 import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-from src import db, macro_feed, news_feed
+from src import db, macro_feed, news_feed, execution_report
 
 app = Flask(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +52,7 @@ def _download_state():
                 raise RuntimeError(f"неожиданные файлы в state-asset: {sorted(names)}")
             tf.extractall(tmp, filter="data")
         candidate = os.path.join(tmp, "data", "bot.db")
-        with sqlite3.connect(candidate) as check_conn:
+        with closing(sqlite3.connect(candidate)) as check_conn:
             check = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
         if check != "ok":
             raise RuntimeError(f"повреждённый state-asset: {check}")
@@ -106,7 +107,11 @@ def _news():
 
 
 def _status_payload():
-    conn = db.connect(CFG["db_path"])
+    with closing(db.connect(CFG["db_path"])) as conn:
+        return _status_from_connection(conn)
+
+
+def _status_from_connection(conn):
     out = {"counts": {}, "agents": [], "decisions": [], "trades": [], "paper": {}}
     for st in ("candidate", "promoted", "killed"):
         out["counts"][st] = len(db.get_agents(conn, st))
@@ -129,32 +134,29 @@ def _status_payload():
     recent_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE mode IN ('live','legacy') "
         "ORDER BY id DESC LIMIT 30").fetchall()
+    net_by_id = {t["id"]: t["net_pnl"] for t in execution_report.trade_results(conn)}
     for t in recent_trades:
         out["trades"].append({
             "ts": t["ts"][11:19], "agent_id": t["agent_id"], "symbol": t["symbol"],
             "side": t["side"], "price": round(t["price"], 2),
-            "pnl": t["pnl"], "reason": t["reason"]})
+            "pnl": net_by_id.get(t["id"]), "reason": t["reason"],
+            "mode": t["mode"], "experiment_id": t["experiment_id"]})
 
-    closed = conn.execute(
-        "SELECT pnl FROM paper_trades WHERE pnl IS NOT NULL "
-        "AND mode IN ('live','legacy') ORDER BY id").fetchall()
-    pnls = [t["pnl"] for t in closed]
+    out["experiment"] = execution_report.build(conn)
     out["paper"] = {
-        "closed_trades": len(pnls),
-        "realized_pnl": round(sum(pnls), 2) if pnls else 0,
-        "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls), 3) if pnls else 0,
+        **out["experiment"]["current"],
         "start_capital": CFG["paper"]["starting_capital"]}
 
     acc = conn.execute("SELECT * FROM live_account WHERE id=1").fetchone()
     positions = conn.execute(
-        "SELECT p.*,a.timeframe FROM live_positions p LEFT JOIN agents a ON a.id=p.agent_id"
+        "SELECT p.*,a.timeframe agent_timeframe FROM live_positions p LEFT JOIN agents a ON a.id=p.agent_id"
     ).fetchall()
     cash = acc["capital"] if acc else CFG["paper"]["starting_capital"]
     equity = cash
     for p in positions:
         mark = conn.execute(
             "SELECT close FROM candles WHERE symbol=? AND timeframe=? "
-            "ORDER BY open_time DESC LIMIT 1", (p["symbol"], p["timeframe"] or CFG["timeframe"])
+            "ORDER BY open_time DESC LIMIT 1", (p["symbol"], p["timeframe"] or p["agent_timeframe"] or CFG["timeframe"])
         ).fetchone()
         price = p["mark_price"] or (mark["close"] if mark else p["entry_price"])
         notional = p["notional"] or p["units"] * p["entry_price"]
@@ -168,7 +170,6 @@ def _status_payload():
     out["macro"] = _macro()
     out["news"] = _news()
     out["sync"] = {"status": SYNC["status"], "last_ok": SYNC["last_ok"]}
-    conn.close()
     return out
 
 
@@ -216,7 +217,7 @@ letter-spacing:.06em;margin:0 0 10px}
 .risk_on{background:rgba(34,197,94,.15);color:var(--grn)}
 .risk_off{background:rgba(239,68,68,.15);color:var(--red)}
 .neutral{background:rgba(132,147,168,.15);color:var(--mut)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px;min-width:0;overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--mut);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line)}
 td{padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -226,7 +227,7 @@ tr:last-child td{border-bottom:none}
 .t-promote,.t-promoted{background:rgba(34,197,94,.15);color:var(--grn)}
 .t-kill,.t-killed{background:rgba(239,68,68,.15);color:var(--red)}
 .t-hold,.t-candidate{background:rgba(59,130,246,.15);color:var(--blu)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}
 @media(max-width:860px){.grid{grid-template-columns:1fr}}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--grn);margin-right:6px}
 .mut{color:var(--mut)}
@@ -245,6 +246,18 @@ tr:last-child td{border-bottom:none}
 </div>
 
 <div class="cards" id="cards"></div>
+
+<div class="panel">
+  <h2>Качество эксперимента</h2>
+  <div class="mut" id="experiment-id" style="overflow-wrap:anywhere"></div>
+  <div id="execution-health" style="margin:10px 0;white-space:pre-wrap"></div>
+  <div class="mut">Сверка кэша действует с момента включения журнала движений.
+    Неполная минута входа исключена из проверки экстремумов. Неизвестный PnL не включается в статистику.</div>
+  <div style="overflow:auto"><table><thead><tr>
+    <th>Эксперимент</th><th>Режим</th><th>Закрыто</th><th>Без полного PnL</th>
+    <th>Чистый PnL</th><th>Прибыльных</th><th>Profit factor</th>
+  </tr></thead><tbody id="cohorts"></tbody></table></div>
+</div>
 
 <div class="panel">
   <h2>Прогресс обучения (из облака, обновляется само)</h2>
@@ -322,12 +335,40 @@ async function refresh(){
    <div class="card"><div class="l">Equity (кэш + позиции)</div><div class="v ${cls(ret)}">${num(cap,0)}</div></div>
    <div class="card"><div class="l">Свободный кэш</div><div class="v">${num(d.live.capital,0)}</div></div>
    <div class="card"><div class="l">Доходность</div><div class="v ${cls(ret)}">${(ret*100).toFixed(2)}%</div></div>
-   <div class="card"><div class="l">Реализованный PnL</div><div class="v ${cls(d.paper.realized_pnl)}">${num(d.paper.realized_pnl,0)}</div></div>
-   <div class="card"><div class="l">Закрытых live-сделок</div><div class="v">${d.paper.closed_trades}</div></div>
+   <div class="card"><div class="l">Чистый PnL текущего эксперимента</div><div class="v ${cls(d.paper.realized_pnl)}">${num(d.paper.realized_pnl,2)}</div></div>
+   <div class="card"><div class="l">Закрыто в текущем эксперименте</div><div class="v">${d.paper.closed_trades}</div></div>
    <div class="card"><div class="l">Кандидаты</div><div class="v">${d.counts.candidate}</div></div>
    <div class="card"><div class="l">Продвинуто (live)</div><div class="v" style="color:var(--grn)">${d.counts.promoted}</div></div>
    <div class="card"><div class="l">Убито всего</div><div class="v" style="color:var(--red)">${d.counts.killed}</div></div>
    <div class="card"><div class="l">Открытых позиций</div><div class="v">${d.live.open_positions}</div></div>`;
+
+  const ex=d.experiment||{}, health=ex.health||{}, rec=ex.reconciliation||{};
+  const escapeText=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const labels={position_open:'позиция уже открыта',closed_this_tick:'закрыто на этом тике',
+    closed_this_bar:'закрыто на этой свече',quote_unavailable:'нет свежей котировки',
+    no_signal:'нет сигнала',data_unavailable:'неполные рыночные данные',ledger_mismatch:'расхождение учёта',macro:'макро-фильтр',
+    news:'новостной фильтр',stoploss_guard:'серия убытков',drawdown:'лимит просадки',
+    symbol_lock:'символ заблокирован',symbol_limit:'лимит на символ',position_limit:'лимит позиций',
+    invalid_atr:'некорректный ATR',insufficient_cash:'недостаточно кэша',opened:'открыто'};
+  $('#experiment-id').textContent='Текущий эксперимент: '+(ex.current_experiment||'—');
+  const freshness=health.age_seconds==null?'Нет данных о выполнении':
+    'Последний успешный тик: '+Math.floor(health.age_seconds)+' с назад';
+  const reconciliation=!rec.available?'Сверка кэша: ещё нет исходной точки':
+    'Сверка кэша: '+(rec.ok?'совпадает':'РАСХОЖДЕНИЕ')+
+    ' · разница '+num(rec.difference,6)+' · операций без движения кэша '+rec.untracked_trades;
+  const entries=Object.entries(health.entry_reasons||{}).map(([k,v])=>(labels[k]||k)+': '+v).join(' · ');
+  const quotes=Object.entries(health.quotes||{}).map(([k,v])=>k+': '+
+    (v.available?'отставание свечей '+Math.floor(v.age_seconds||0)+' с':'нет свежих данных')).join(' · ');
+  const gaps=Object.entries(health.position_gaps||{}).map(([k,v])=>'Позиция #'+k+': '+v).join(' · ');
+  $('#execution-health').textContent=[freshness,reconciliation,entries,quotes,gaps,
+    (health.issues||[]).join(' · ')].filter(Boolean).join('\n');
+  $('#cohorts').innerHTML=(ex.cohorts||[]).map(c=>`<tr>
+    <td style="max-width:350px;overflow-wrap:anywhere">${escapeText(c.experiment_id)}</td>
+    <td>${escapeText(c.mode)}</td><td>${c.closed_trades}</td><td>${c.unknown_pnl_trades}</td>
+    <td class="${cls(c.realized_pnl)}">${num(c.realized_pnl,2)}</td>
+    <td>${c.win_rate==null?'—':(100*c.win_rate).toFixed(1)+'%'}</td>
+    <td>${c.profit_factor==null?'—':num(c.profit_factor,2)}</td></tr>`).join('')
+    ||'<tr><td colspan=7 class="mut">Закрытых сделок пока нет</td></tr>';
 
   $('#agents').innerHTML=d.agents.map(a=>`<tr>
     <td>${a.id}</td><td>${a.type}</td><td>${a.symbol}</td>

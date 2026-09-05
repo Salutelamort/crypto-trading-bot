@@ -20,7 +20,7 @@ import time
 import yaml
 
 from src import data_feed as feed
-from src import db, evolution, live_trade, macro_feed, news_feed, supervisor
+from src import db, evolution, live_trade, macro_feed, news_feed, supervisor, execution_report
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",
@@ -30,10 +30,14 @@ HEADER = ["date", "equity", "capital", "open_positions",
 
 def _write_state_summary(conn, cfg, cycles, snapshot):
     """Маленький отслеживаемый снимок; тяжёлая SQLite живёт в release-asset."""
+    quality = execution_report.build(conn)
     payload = {
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "experiment_id": db.get_runtime_state(conn, "current_experiment", "legacy"),
         **snapshot, "cycles": cycles,
+        "execution_health": quality["health"],
+        "experiment_metrics": quality["current"],
+        "cash_reconciliation": quality["reconciliation"],
     }
     os.makedirs("state", exist_ok=True)
     tmp = "state/latest.json.tmp"

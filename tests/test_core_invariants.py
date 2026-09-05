@@ -4,6 +4,7 @@ import random
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest import mock
 
 import pandas as pd
@@ -37,8 +38,7 @@ def base_cfg():
 
 class CoreInvariantTests(unittest.TestCase):
     def test_short_equity_uses_direction(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            conn = db.connect(os.path.join(tmp, "bot.db"))
+        with tempfile.TemporaryDirectory() as tmp, closing(db.connect(os.path.join(tmp, "bot.db"))) as conn:
             genome_data = genome.random_genome("BTCUSDT", "1h", random.Random(1))
             aid = db.insert_agent(conn, genome_data, "BTCUSDT", "1h")
             conn.execute(
@@ -156,24 +156,24 @@ class CoreInvariantTests(unittest.TestCase):
                         "pnl REAL, reason TEXT)")
             old.commit()
             old.close()
-            conn = db.connect(path)
-            meta = db.ensure_experiment(conn, base_cfg())
-            g = genome.random_genome("BTCUSDT", "1h", random.Random(3))
-            aid = db.insert_agent(conn, g, "BTCUSDT", "1h")
-            db.log_paper_trade(conn, aid, "BTCUSDT", "BUY", 100, 1, 0, None, "signal")
-            row = conn.execute("SELECT mode,experiment_id,config_hash FROM paper_trades").fetchone()
-            self.assertEqual(row["mode"], "live")
-            self.assertEqual(row["experiment_id"], meta["experiment_id"])
-            self.assertEqual(row["config_hash"], meta["config_hash"])
-            db.log_paper_trade(
-                conn, aid, "BTCUSDT", "SELL", 101, 1, 0, 1, "signal",
-                mode="legacy", provenance={"experiment_id": "legacy",
-                                           "code_sha": None, "config_hash": None},
-            )
-            legacy = conn.execute("SELECT mode,experiment_id FROM paper_trades "
-                                  "ORDER BY id DESC LIMIT 1").fetchone()
-            self.assertEqual((legacy["mode"], legacy["experiment_id"]),
-                             ("legacy", "legacy"))
+            with closing(db.connect(path)) as conn:
+                meta = db.ensure_experiment(conn, base_cfg())
+                g = genome.random_genome("BTCUSDT", "1h", random.Random(3))
+                aid = db.insert_agent(conn, g, "BTCUSDT", "1h")
+                db.log_paper_trade(conn, aid, "BTCUSDT", "BUY", 100, 1, 0, None, "signal")
+                row = conn.execute("SELECT mode,experiment_id,config_hash FROM paper_trades").fetchone()
+                self.assertEqual(row["mode"], "live")
+                self.assertEqual(row["experiment_id"], meta["experiment_id"])
+                self.assertEqual(row["config_hash"], meta["config_hash"])
+                db.log_paper_trade(
+                    conn, aid, "BTCUSDT", "SELL", 101, 1, 0, 1, "signal",
+                    mode="legacy", provenance={"experiment_id": "legacy",
+                                               "code_sha": None, "config_hash": None},
+                )
+                legacy = conn.execute("SELECT mode,experiment_id FROM paper_trades "
+                                      "ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual((legacy["mode"], legacy["experiment_id"]),
+                                 ("legacy", "legacy"))
 
     def test_macro_failure_is_visible(self):
         with mock.patch("src.macro_feed.requests.get", side_effect=TimeoutError):

@@ -171,14 +171,18 @@ def _migrate(conn):
             ("experiment_id", "TEXT NOT NULL DEFAULT 'legacy'"),
             ("code_sha", "TEXT"), ("config_hash", "TEXT"),
             ("last_checked_at", "TEXT"), ("mark_price", "REAL"),
-            ("entry_fee_paid", "INTEGER NOT NULL DEFAULT 0")):
+            ("entry_fee_paid", "INTEGER NOT NULL DEFAULT 0"),
+            ("stop_mult", "REAL"), ("take_mult", "REAL"), ("trail_mult", "REAL"),
+            ("entry_fee", "REAL"), ("risk_snapshot", "TEXT"),
+            ("timeframe", "TEXT"), ("mark_at", "TEXT")):
         if col not in pcols:
             conn.execute(f"ALTER TABLE live_positions ADD COLUMN {col} {spec}")
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
     for col, spec in (
             ("mode", "TEXT NOT NULL DEFAULT 'legacy'"),
             ("experiment_id", "TEXT NOT NULL DEFAULT 'legacy'"),
-            ("code_sha", "TEXT"), ("config_hash", "TEXT")):
+            ("code_sha", "TEXT"), ("config_hash", "TEXT"),
+            ("net_pnl", "REAL"), ("cash_delta", "REAL")):
         if col not in tcols:
             conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {spec}")
     conn.commit()
@@ -189,13 +193,14 @@ def get_runtime_state(conn, key, default=None):
     return row["value"] if row else default
 
 
-def set_runtime_state(conn, key, value):
+def set_runtime_state(conn, key, value, *, commit=True):
     conn.execute(
         "INSERT INTO runtime_state(key,value,updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         (key, str(value), now_iso()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _code_sha():
@@ -234,7 +239,7 @@ def _source_hash():
         return "unknown"
 
 
-def ensure_experiment(conn, cfg):
+def ensure_experiment(conn, cfg, *, commit=True):
     """Регистрирует текущую forward-когорту без сброса счёта или старых сделок."""
     raw = json.dumps(cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     config_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -247,7 +252,7 @@ def ensure_experiment(conn, cfg):
         "VALUES (?,?,?,?, 'active')",
         (experiment_id, now_iso(), code_sha, config_hash),
     )
-    set_runtime_state(conn, "current_experiment", experiment_id)
+    set_runtime_state(conn, "current_experiment", experiment_id, commit=commit)
     return {"experiment_id": experiment_id, "code_sha": code_sha,
             "config_hash": config_hash}
 
@@ -437,7 +442,8 @@ def prune_history(conn, keep_killed=3000, keep_decisions=8000):
     da = conn.execute(
         "DELETE FROM agents WHERE status='killed' AND id NOT IN "
         "(SELECT id FROM agents WHERE status='killed' ORDER BY id DESC LIMIT ?) "
-        "AND id NOT IN (SELECT DISTINCT agent_id FROM paper_trades)",
+        "AND id NOT IN (SELECT DISTINCT agent_id FROM paper_trades) "
+        "AND id NOT IN (SELECT agent_id FROM live_positions)",
         (keep_killed,)).rowcount
     dd = conn.execute(
         "DELETE FROM decisions WHERE id NOT IN "
@@ -480,13 +486,17 @@ def quarantined_symbols(conn) -> set:
 
 # ---------- сделки ----------
 def log_paper_trade(conn, agent_id, symbol, side, price, qty, fee, pnl, reason,
-                    mode="live", provenance=None):
+                    mode="live", provenance=None, *, net_pnl=None, cash_delta=None,
+                    ts=None, commit=True):
     provenance = provenance or current_provenance(conn)
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO paper_trades "
-        "(agent_id,symbol,side,ts,price,qty,fee,pnl,reason,mode,experiment_id,code_sha,config_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (agent_id, symbol, side, now_iso(), price, qty, fee, pnl, reason, mode,
-         provenance["experiment_id"], provenance["code_sha"], provenance["config_hash"]),
+        "(agent_id,symbol,side,ts,price,qty,fee,pnl,reason,mode,experiment_id,code_sha,config_hash,"
+        "net_pnl,cash_delta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (agent_id, symbol, side, ts or now_iso(), price, qty, fee, pnl, reason, mode,
+         provenance["experiment_id"], provenance["code_sha"], provenance["config_hash"],
+         net_pnl, cash_delta),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
+    return cur.lastrowid

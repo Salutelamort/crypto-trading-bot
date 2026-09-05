@@ -87,7 +87,8 @@ def main():
     # --- итоговая таблица ---
     print(f"\n\n{'#'*64}\n  СРАВНЕНИЕ R:R\n{'#'*64}")
     hdr = f"{'метрика':28s}" + "".join(f"{r['name']:>16s}" for r in results)
-    print(hdr); print("-" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
 
     def row(label, fn):
         print(f"{label:28s}" + "".join(f"{fn(r):>16s}" for r in results))

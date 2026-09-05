@@ -121,13 +121,14 @@ def run_paper(conn, cfg, data_by_key):
                     fill = exit_price * (1 - slip * pos.direction)
                     pnl = rk.close_pnl(pos, fill, fee)
                     capital += pos.notional + pnl
-                    realized_pnl += pnl
+                    net_pnl = pnl - pos.notional * fee
+                    realized_pnl += net_pnl
                     trade_count += 1
-                    wins += 1 if pnl > 0 else 0
+                    wins += 1 if net_pnl > 0 else 0
                     side = "SELL" if pos.direction == 1 else "COVER"
                     db.log_paper_trade(conn, aid, a["symbol"], side,
                                        fill, pos.units, pos.units * fill * fee,
-                                       round(pnl, 2), reason, mode="historical")
+                                       pnl, reason, mode="historical", net_pnl=net_pnl)
                     del open_positions[aid]
                     cooldown_left[aid] = int(s["g"].get("cooldown", 0))
                     exited_this_bar = True

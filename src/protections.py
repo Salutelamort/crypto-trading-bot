@@ -11,6 +11,8 @@
 """
 from datetime import datetime, timedelta, timezone
 
+from .execution_report import trade_results
+
 # закрывающие сделки (по ним считаем реализованный PnL)
 _CLOSE_SIDES = ("SELL", "COVER")
 
@@ -31,10 +33,9 @@ def stoploss_guard(conn, cfg):
     window = p.get("window_hours", 24)
     max_losses = p.get("max_losses", 4)
     cutoff = _cutoff_iso(window)
-    n = conn.execute(
-        f"SELECT COUNT(*) FROM paper_trades "
-        f"WHERE side IN {_CLOSE_SIDES} AND pnl < 0 AND ts >= ?",
-        (cutoff,)).fetchone()[0]
+    n = sum(1 for trade in trade_results(conn)
+            if trade["ts"] >= cutoff
+            and (trade["net_pnl"] if trade["net_pnl"] is not None else trade["pnl"]) < 0)
     if n >= max_losses:
         return True, f"StoplossGuard: {n} убыточных закрытий за {window}ч (>= {max_losses})"
     return False, ""
@@ -54,8 +55,9 @@ def locked_symbols(conn, cfg) -> set:
     start_cap = float(cfg.get("paper", {}).get("starting_capital", 10000))
     limit = -abs(max_loss_frac) * start_cap
     cutoff = _cutoff_iso(window)
-    rows = conn.execute(
-        f"SELECT symbol, COALESCE(SUM(pnl),0) AS net FROM paper_trades "
-        f"WHERE side IN {_CLOSE_SIDES} AND ts >= ? GROUP BY symbol",
-        (cutoff,)).fetchall()
-    return {r["symbol"] for r in rows if r["net"] <= limit}
+    totals = {}
+    for trade in trade_results(conn):
+        if trade["ts"] >= cutoff:
+            net = trade["net_pnl"] if trade["net_pnl"] is not None else trade["pnl"]
+            totals[trade["symbol"]] = totals.get(trade["symbol"], 0) + net
+    return {symbol for symbol, net in totals.items() if net <= limit}
