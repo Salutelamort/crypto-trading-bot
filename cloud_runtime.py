@@ -1,6 +1,8 @@
 """Single Railway paper writer with persistent SQLite, supervised research and read-only HTTP."""
+import base64
 import csv
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -90,13 +92,40 @@ def claim_writer(data_dir):
     return handle
 
 
-def make_handler(data_dir, status):
+def authorized(auth_header, route, password, user="owner"):
+    """HTTP Basic gate for a publicly exposed panel. `/health` stays open so the
+    platform health check works; everything else needs the password once it is
+    set. No password set => open (kept for private/internal deployments)."""
+    if not password or route == "/health":
+        return True
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[6:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    got_user, sep, got_pass = decoded.partition(":")
+    if not sep:
+        return False
+    # constant-time compare avoids leaking the password via timing
+    return (hmac.compare_digest(got_user, user)
+            and hmac.compare_digest(got_pass, password))
+
+
+def make_handler(data_dir, status, password="", user="owner"):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             pass
 
         def do_GET(self):
             route = self.path.split("?", 1)[0]
+            if not authorized(self.headers.get("Authorization"), route, password, user):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="paper"')
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             code, mime = 200, "application/json; charset=utf-8"
             if route == "/health":
                 payload = {"mode": "paper", **status}
@@ -159,7 +188,13 @@ def main():
     stop = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_args: stop.set())
-    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), make_handler(data_dir, status))
+    panel_password = os.environ.get("DASHBOARD_PASSWORD", "")
+    panel_user = os.environ.get("DASHBOARD_USER", "owner")
+    if not panel_password:
+        print("WARNING: DASHBOARD_PASSWORD not set — panel is OPEN. Set it before "
+              "creating a public Railway domain.", flush=True)
+    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))),
+                                 make_handler(data_dir, status, panel_password, panel_user))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     paper, research, writer_lock = None, None, None

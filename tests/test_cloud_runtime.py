@@ -79,6 +79,20 @@ class CloudRuntimeTests(unittest.TestCase):
             cloud_runtime.verify_database(root / "backup.db")
             cloud_runtime.verify_database(root / "bot.db")
 
+    def test_panel_auth_gate(self):
+        import base64
+
+        good = "Basic " + base64.b64encode(b"owner:s3cret").decode()
+        wrong = "Basic " + base64.b64encode(b"owner:nope").decode()
+        # no password configured => panel open (private/internal deployment)
+        self.assertTrue(cloud_runtime.authorized(None, "/api/summary", ""))
+        # password set: health stays open, data routes require correct credentials
+        self.assertTrue(cloud_runtime.authorized(None, "/health", "s3cret"))
+        self.assertFalse(cloud_runtime.authorized(None, "/api/summary", "s3cret"))
+        self.assertFalse(cloud_runtime.authorized(wrong, "/api/summary", "s3cret"))
+        self.assertFalse(cloud_runtime.authorized("Bearer x", "/", "s3cret"))
+        self.assertTrue(cloud_runtime.authorized(good, "/api/summary", "s3cret"))
+
 
 if __name__ == "__main__":
     unittest.main()
