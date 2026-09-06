@@ -56,7 +56,7 @@ def locked_symbols(conn, cfg) -> set:
     limit = -abs(max_loss_frac) * start_cap
     cutoff = _cutoff_iso(window)
     totals = {}
-    for trade in trade_results(conn):
+    for trade in trade_results(conn, aggregate=False):
         if trade["ts"] >= cutoff:
             net = trade["net_pnl"] if trade["net_pnl"] is not None else trade["pnl"]
             totals[trade["symbol"]] = totals.get(trade["symbol"], 0) + net

@@ -32,7 +32,7 @@ def write_summary(conn, cfg, path="state/latest.json"):
     temp = target.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8")
     temp.replace(target)
-    print(json.dumps({"event": "paper_snapshot", "at": health.get("at"),
+    print("PAPER_SNAPSHOT " + json.dumps({"event": "paper_snapshot", "at": health.get("at"),
                       "cash": health.get("cash"), "equity": health.get("equity"),
                       "positions": health.get("open_positions"),
                       "cash_reconciliation": quality["reconciliation"],
@@ -85,7 +85,8 @@ def main():
     if args.db_path:
         cfg["db_path"] = args.db_path
     cfg.setdefault("runner", {})["candidate_path"] = str(Path(args.state_dir) / "candidates.json")
-    stream = market_data.BookStream(cfg["symbols"], cfg.get("execution", {}).get("max_quote_age_seconds", 5))
+    stream = market_data.BookStream(cfg["symbols"], cfg.get("execution", {}).get("max_quote_age_seconds", 5),
+                                   require_depth=cfg.get("execution", {}).get("require_depth_entries", False))
     if cfg.get("execution", {}).get("use_websocket", False):
         stream.start()
     deadline = time.monotonic() + args.window_minutes * 60 if args.window_minutes > 0 else None

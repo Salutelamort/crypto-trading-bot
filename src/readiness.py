@@ -69,6 +69,7 @@ def evaluate(conn, cfg, *, frozen=False, trial_count=1, now=None):
         "cash_reconciliation": execution_report.cash_reconciliation(conn).get("ok", False),
         "spot_long_only": cfg["risk"].get("pricing_model") == "spot" and not cfg["risk"].get("allow_short", False),
         "order_book_model": cfg.get("execution", {}).get("use_order_book", False),
+        "no_pending_exits": not conn.execute("SELECT 1 FROM runtime_state WHERE key LIKE 'exit_intent:%' LIMIT 1").fetchone(),
     }
     reasons.extend(key for key, passed in checks.items() if not passed)
     result = {"status": "eligible_for_human_review" if not reasons else "collecting_or_failed",

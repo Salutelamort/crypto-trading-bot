@@ -19,7 +19,7 @@
 import json
 import math
 
-from . import db
+from . import db, strategy_audit
 from . import execution_core as core
 from . import genome as gn
 from . import metrics as mt
@@ -93,6 +93,8 @@ def _decide(agents, cfg, quarantined, sr0=0.0):
             edge_ok = edge_ok and probability >= sup.get("min_dsr_probability", .95)
         if sup.get("require_current_model", False):
             edge_ok = edge_ok and a.get("model_version") == core.MODEL_VERSION
+        if sup.get("require_signal_audit", False):
+            edge_ok = edge_ok and strategy_audit.passed(a.get("signal_audit"))
         if sup.get("require_cost_stress", False):
             edge_ok = (edge_ok and _number(a.get("stress_return"), -1) > 0
                        and _number(a.get("stress_pf"), 0) >= sup.get("stress_min_pf", 1.05))

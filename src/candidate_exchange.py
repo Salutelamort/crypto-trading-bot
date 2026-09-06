@@ -74,7 +74,7 @@ def import_snapshot(conn, cfg, path):
             fields = ("train_sharpe", "train_return", "train_winrate", "train_trades", "test_sharpe",
                       "test_return", "test_winrate", "test_trades", "test_maxdd", "test_buyhold", "test_alpha",
                       "test_sortino", "test_calmar", "test_pf", "consistency", "return_stats", "model_version",
-                      "stress_return", "stress_pf")
+                      "stress_return", "stress_pf", "signal_audit")
             # Keep research status only when the same mandatory selection gates pass.
             local = {**a, "id": aid}
             decision = supervisor._decide([local], cfg, set(), a["dsr_reference_sharpe"])[0][1]

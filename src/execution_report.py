@@ -6,11 +6,31 @@ from datetime import datetime, timezone
 from . import db
 
 
-def trade_results(conn):
+def trade_results(conn, *, aggregate=True):
     """Keep settlement PnL intact; derive full trade PnL only with matching evidence."""
     pending, results = {}, []
-    for row in conn.execute("SELECT * FROM paper_trades WHERE mode IN ('live','legacy') ORDER BY id"):
+    metadata = {r["trade_id"]: dict(r) for r in conn.execute("SELECT * FROM exit_fills")}
+    rows = [dict(r) for r in conn.execute("SELECT * FROM paper_trades WHERE mode IN ('live','legacy') ORDER BY id")]
+    if aggregate:
+        groups = {}
+        for row in rows:
+            info = metadata.get(row["id"])
+            if info:
+                groups.setdefault(info["position_key"], []).append(row)
+        combined = {}
+        for fills in groups.values():
+            last = dict(fills[-1])
+            for field in ("qty", "fee", "pnl", "net_pnl", "cash_delta"):
+                last[field] = sum(f[field] for f in fills) if all(f[field] is not None for f in fills) else None
+            last["price"] = sum(f["price"] * f["qty"] for f in fills) / last["qty"]
+            last["fill_count"] = len(fills)
+            combined[last["id"]] = last
+        rows = [combined.get(r["id"], r) for r in rows if r["id"] not in metadata or r["id"] in combined]
+    for row in rows:
         trade = dict(row)
+        info = metadata.get(trade["id"])
+        trade["is_closed"] = bool(info["is_closed"]) if info else True
+        trade["remaining_qty"] = info["remaining_qty"] if info else 0
         key = (trade["agent_id"], trade["symbol"], trade["mode"], trade["experiment_id"])
         if trade["side"] in ("BUY", "SHORT"):
             # Multiple unmatched entries are ambiguous; do not choose one arbitrarily.
@@ -33,12 +53,14 @@ def trade_results(conn):
 
 
 def summarize(trades):
-    known = [t["net_pnl"] for t in trades if t["net_pnl"] is not None]
+    closed = [t for t in trades if t.get("is_closed", True)]
+    known = [t["net_pnl"] for t in closed if t["net_pnl"] is not None]
     profit = sum(p for p in known if p > 0)
     loss = -sum(p for p in known if p < 0)
-    return {"closed_trades": len(trades), "known_pnl_trades": len(known),
-            "unknown_pnl_trades": len(trades) - len(known),
-            "realized_pnl": sum(known),
+    return {"closed_trades": len(closed), "known_pnl_trades": len(known),
+            "unknown_pnl_trades": len(closed) - len(known),
+            "partially_closed_positions": len(trades) - len(closed),
+            "realized_pnl": sum(t["net_pnl"] for t in trades if t["net_pnl"] is not None),
             "win_rate": sum(p > 0 for p in known) / len(known) if known else None,
             "profit_factor": profit / loss if loss else None,
             "mean_pnl": sum(known) / len(known) if known else None}

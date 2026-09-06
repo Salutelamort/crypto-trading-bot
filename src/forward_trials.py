@@ -4,7 +4,7 @@ import hashlib
 import json
 from contextlib import closing
 
-from . import db, live_trade, readiness
+from . import db, live_trade, readiness, strategy_audit
 from .execution_core import MODEL_VERSION
 
 
@@ -28,8 +28,11 @@ def enroll(conn, cfg):
                 or (agent.get("test_trades") or 0) < 20):
             continue
         genome = json.loads(agent["genome"])
+        if cfg.get("supervisor", {}).get("require_signal_audit", False) and not strategy_audit.passed(agent.get("signal_audit")):
+            continue
         frozen_cfg = copy.deepcopy(cfg)
         frozen_cfg["forward"] = {"enabled": False}
+        frozen_cfg.setdefault("execution", {})["record_book_depth"] = False
         frozen_cfg["risk"]["max_open_positions"] = 1
         frozen_cfg["live"]["allow_unpromoted"] = False
         frozen_cfg.setdefault("runner", {})["require_candidate_snapshot"] = False

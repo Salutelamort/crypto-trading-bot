@@ -22,8 +22,9 @@ import random
 import pandas as pd
 
 from . import backtest as bt
-from . import db
+from . import db, strategy_audit
 from . import genome as gn
+from .evaluation_cache import EvaluationCache
 
 
 def _fitness(agent, min_trades):
@@ -46,9 +47,21 @@ def _fitness(agent, min_trades):
 
 def _evaluate(genome, df, cfg):
     """Walk-forward оценка агента. consistency = доля прибыльных OOS окон."""
-    train, test, consistency = bt.walk_forward_eval(genome, df, cfg)
+    train, test, consistency = bt.walk_forward_eval(genome, df, cfg, record_trades=False)
     factors = cfg.get("validation", {}).get("cost_stress_multipliers", [])
-    if factors and test["total_return"] > 0 and test["num_trades"] >= cfg["supervisor"].get("promote_min_trades", 20):
+    plausible = test["total_return"] > 0 and test["num_trades"] >= cfg["supervisor"].get("promote_min_trades", 20)
+    audit_ok = True
+    if plausible and cfg.get("validation", {}).get("signal_audit_enabled", False):
+        test["signal_audit"] = strategy_audit.audit_signal(
+            genome, df, allow_short=cfg["risk"].get("allow_short", False))
+        audit_ok = strategy_audit.passed(test["signal_audit"])
+        if audit_ok and cfg.get("validation", {}).get("parameter_stability_enabled", False):
+            neighborhood = strategy_audit.parameter_stability(genome, df.iloc[:int(len(df) * cfg["train_ratio"])], cfg)
+            test["signal_audit"]["parameter_stability"] = neighborhood
+            audit_ok = neighborhood["status"] == "passed"
+            if not audit_ok:
+                test["signal_audit"]["status"] = "failed"
+    if factors and plausible and audit_ok:
         start = int(len(df) * cfg["train_ratio"]) + cfg.get("validation", {}).get("embargo_bars", 0)
         signal = gn.signal(genome, df, cfg["risk"].get("allow_short", False)).shift(
             cfg.get("execution", {}).get("signal_delay_bars", 1)).fillna(0)
@@ -56,7 +69,7 @@ def _evaluate(genome, df, cfg):
         for factor in factors:
             stressed = copy.deepcopy(cfg)
             stressed["costs"] = {key: value * factor for key, value in cfg["costs"].items()}
-            stressed_results.append(bt.run(genome, df.iloc[start:], stressed, sig=signal.iloc[start:]))
+            stressed_results.append(bt.run(genome, df.iloc[start:], stressed, sig=signal.iloc[start:], record_trades=False))
         test["stress_return"] = min(item["total_return"] for item in stressed_results)
         test["stress_pf"] = min(item["profit_factor"] for item in stressed_results)
     return train, test, consistency
@@ -168,8 +181,7 @@ def _anti_clone(conn, cfg, data_by_key):
                        (a["test_sharpe"] if a["test_sharpe"] is not None else -99))
              for a in alive}
     # от сильнейших к слабым: сильный занимает «нишу», похожие на него — убиваются.
-    # Корреляцию считаем ТОЛЬКО внутри одного таймфрейма (у разных ТФ разная сетка
-    # баров — это уже диверсификация по построению).
+    # Series were aligned to complete UTC days, including different timeframes.
     order = sorted(info.keys(), key=lambda i: score[i], reverse=True)
     kept, killed = [], 0
     for i in order:
@@ -180,14 +192,18 @@ def _anti_clone(conn, cfg, data_by_key):
             if len(paired) < cfg["evolution"].get("correlation_min_days", 60):
                 continue
             c = paired.iloc[:, 0].corr(paired.iloc[:, 1])
-            if pd.notna(c) and c > thresh:
+            losses = paired.clip(upper=0)
+            loss_corr = losses.iloc[:, 0].corr(losses.iloc[:, 1]) if (losses < 0).sum().min() >= 20 else None
+            if ((pd.notna(c) and c > thresh)
+                    or (loss_corr is not None and pd.notna(loss_corr)
+                        and loss_corr > cfg["evolution"].get("anti_clone_loss_corr", 1.0))):
                 clone = True
                 break
         if clone:
             db.set_agent_status(conn, i, "killed")
             db.log_decision(conn, i, "kill", "rules",
-                            f"анти-клон: корреляция дохода > {thresh} с более сильным агентом "
-                            f"(нет диверсификации)")
+                            "анти-клон: совпадение доходностей или убыточных дней с более сильным агентом "
+                            "(нет диверсификации)")
             killed += 1
         else:
             kept.append(i)
@@ -205,6 +221,7 @@ def evolve(conn, cfg, data_by_key):
     # (бег на месте). Теперь seed случайный — пространство стратегий реально
     # исследуется от прогона к прогону. Выжившие накапливаются в БД (эволюция).
     ev = cfg["evolution"]
+    cache = EvaluationCache(ev.get("evaluation_cache_size", 64))
     rng = random.Random(ev.get("seed"))
     quarantined = db.quarantined_symbols(conn)
     # доступные пары (символ, таймфрейм): есть данные и символ не в карантине
@@ -244,7 +261,7 @@ def evolve(conn, cfg, data_by_key):
             df = data_by_key[key]
             if len(df) < 400:
                 continue
-            train_m, test_m, cons = _evaluate(g, df, cfg)
+            train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate)
             aid = db.insert_agent(conn, g, g["symbol"], g["timeframe"])
             db.update_agent_metrics(conn, aid, train_m, test_m, cons)
 

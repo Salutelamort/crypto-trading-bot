@@ -23,7 +23,7 @@ _effective_risk = core.effective_risk
 _exit_levels = core.exit_levels
 
 
-def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
+def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=True) -> dict:
     """
     Симулирует одного агента на исторических данных. Поддерживает ТРИ состояния:
     long (+1), short (-1), кэш (0). Возвращает словарь метрик + кривую equity.
@@ -77,10 +77,11 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
         pnl = notional * gross - notional * (exit_exec / entry_exec) * fee
         net_pnl = pnl - notional * fee
         trade_results.append(net_pnl)
-        trade_log.append({"entry_at": df.index[entry_index].isoformat(),
-                          "exit_at": df.index[i].isoformat(), "direction": direction,
-                          "entry": entry_exec, "exit": exit_exec, "reason": reason,
-                          "net_pnl": net_pnl})
+        if record_trades:
+            trade_log.append({"entry_at": df.index[entry_index].isoformat(),
+                              "exit_at": df.index[i].isoformat(), "direction": direction,
+                              "entry": entry_exec, "exit": exit_exec, "reason": reason,
+                              "net_pnl": net_pnl})
         cash += notional + pnl
         in_pos = False
         direction = 0
@@ -137,6 +138,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None) -> dict:
     m["equity"] = eq
     m["returns"] = rets
     m["trades"] = trade_log
+    m["trade_details_recorded"] = record_trades
     m["return_stats"] = mt.return_statistics(rets)
     m["model_version"] = core.MODEL_VERSION
     return m
@@ -148,7 +150,7 @@ def split_train_test(df: pd.DataFrame, train_ratio: float):
     return df.iloc[:cut], df.iloc[cut:]
 
 
-def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
+def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict, *, record_trades=True):
     """
     WALK-FORWARD валидация (совет из треда против переобучения).
 
@@ -173,7 +175,7 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
     train_df = df.iloc[:cut]
     oos_df = df.iloc[oos_start:]
 
-    train_m = run(genome, train_df, cfg, sig=full_sig.iloc[:cut])
+    train_m = run(genome, train_df, cfg, sig=full_sig.iloc[:cut], record_trades=record_trades)
 
     nwin = cfg.get("validation", {}).get("walk_forward_windows", 4)
     idx = list(range(len(oos_df)))
@@ -181,13 +183,13 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict):
 
     # Итоговые OOS-метрики считаются единым непрерывным прогоном. Усреднять
     # Sharpe/PF/доходности по окнам математически некорректно.
-    test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[oos_start:])
+    test_m = run(genome, oos_df, cfg, sig=full_sig.iloc[oos_start:], record_trades=record_trades)
     results = []
     for w in windows:
         a, b = int(w[0]), int(w[-1]) + 1
         seg = oos_df.iloc[a:b]
         seg_sig = full_sig.iloc[oos_start + a:oos_start + b]
-        results.append(run(genome, seg, cfg, sig=seg_sig))
+        results.append(run(genome, seg, cfg, sig=seg_sig, record_trades=False))
 
     if not results:  # данных мало — единый OOS без оценки устойчивости
         return train_m, test_m, 0.0

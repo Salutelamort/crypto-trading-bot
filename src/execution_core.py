@@ -69,3 +69,51 @@ def fill_price(reference, side, slippage, quote=None, quantity=None, max_spread=
             raise ValueError("insufficient_book_depth")
         base = ask if side == 1 else bid
     return base * (1 + slippage * side)
+
+
+def depth_entry(budget, side, slippage, quote, participation, consumed=0, quantity=None):
+    """Market IOC entry: walk visible levels, cancel unfilled remainder.
+
+    Participation applies per level, and consumed is this account's prior quantity
+    against this snapshot. No queue-position or market-impact claim is made.
+    """
+    if not 0 < participation <= 1 or not math.isfinite(budget) or budget <= 0:
+        raise ValueError("invalid_depth_budget")
+    levels = quote["asks" if side == 1 else "bids"]
+    left = float("inf") if quantity is None else quantity
+    cost, filled = 0., 0.
+    for price, size in levels:
+        available = size * participation
+        skipped = min(available, consumed)
+        consumed -= skipped
+        available -= skipped
+        price *= 1 + side * slippage
+        take = min(available, left, max(0, budget - cost) / price)
+        cost += take * price
+        filled += take
+        left -= take
+        if left <= 0:
+            break
+    if filled <= 0:
+        raise ValueError("insufficient_book_depth")
+    if quantity is not None and not math.isclose(filled, quantity, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("insufficient_book_depth")
+    return filled, cost / filled
+
+
+def depth_exit(quantity, side, slippage, quote, participation, consumed=0):
+    """Fill up to the requested quantity; never invent liquidity for the remainder."""
+    left, filled, value = quantity, 0., 0.
+    for price, size in quote["asks" if side == 1 else "bids"]:
+        available = size * participation
+        skipped = min(available, consumed)
+        consumed -= skipped
+        take = min(left, available - skipped)
+        filled += take
+        value += take * price * (1 + side * slippage)
+        left -= take
+        if left <= 0:
+            break
+    if filled <= 0:
+        raise ValueError("insufficient_exit_depth")
+    return filled, value / filled

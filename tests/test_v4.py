@@ -63,6 +63,11 @@ class V4Tests(unittest.TestCase):
             self.assertEqual(supervisor._decide([a], cfg, set())[0][1], "hold")
             a["return_stats"] = json.dumps({"effective_n": 1000, "sr": .5, "skew": 0, "kurtosis": 3})
             self.assertEqual(supervisor._decide([a], cfg, set())[0][1], "promote")
+            cfg["supervisor"]["require_signal_audit"] = True
+            self.assertEqual(supervisor._decide([a], cfg, set())[0][1], "hold")
+            a["signal_audit"] = json.dumps({"status": "passed", "causal": True,
+                                           "warmup_agreement": 1, "checked": 5})
+            self.assertEqual(supervisor._decide([a], cfg, set())[0][1], "promote")
 
     def test_frozen_trial_isolated_and_version_change_retains_ledger(self):
         cfg = base_cfg()

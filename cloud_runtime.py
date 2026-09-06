@@ -208,7 +208,7 @@ def main():
         writer_lock = claim_writer(data_dir)
         bootstrap(data_dir, os.environ.get("BOOTSTRAP_SHA256", ""))
         with closing(sqlite3.connect((data_dir / "bot.db").resolve().as_uri() + "?mode=ro", uri=True)) as audit:
-            print(json.dumps({"event": "ledger_start", "cash": audit.execute(
+            print("LEDGER_START " + json.dumps({"event": "ledger_start", "cash": audit.execute(
                 "SELECT capital FROM live_account WHERE id=1").fetchone()[0],
                 "trades": audit.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0],
                 "positions": audit.execute("SELECT COUNT(*) FROM live_positions").fetchone()[0]}), flush=True)
@@ -253,9 +253,15 @@ def main():
                 backups.mkdir(exist_ok=True)
                 # Seven rotating daily backups on the mounted disk, not the container layer.
                 slot = int(time.time() // 86400) % 7
-                backup_database(data_dir / "bot.db", backups / f"paper-{slot}.db")
-                print(f"Verified SQLite backup: paper-{slot}.db on mounted volume", flush=True)
-                next_backup = time.monotonic() + 3600
+                try:
+                    backup_database(data_dir / "bot.db", backups / f"paper-{slot}.db")
+                    print(f"Verified SQLite backup: paper-{slot}.db on mounted volume", flush=True)
+                    status["backup"] = "ok"
+                    next_backup = time.monotonic() + 3600
+                except (OSError, sqlite3.Error) as exc:
+                    status["backup"] = "failed_retry_pending"
+                    print(f"Backup failed: {type(exc).__name__}; retry in 300 seconds", flush=True)
+                    next_backup = time.monotonic() + 300
     finally:
         status["phase"] = "stopping"
         stop_child(research)

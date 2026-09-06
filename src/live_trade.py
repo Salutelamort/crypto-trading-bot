@@ -1,13 +1,23 @@
 """Deterministic live paper execution; no exchange orders or credentials."""
+import copy
 import json
 import math
 import time
+from decimal import Decimal, DecimalException
 
 import pandas as pd
 import requests
 
 from . import data_feed as feed
-from . import db, execution_report, macro_feed, market_data, news_feed, protections
+from . import (
+    db,
+    exchange_rules,
+    execution_report,
+    macro_feed,
+    market_data,
+    news_feed,
+    protections,
+)
 from . import execution_core as core
 from . import genome as gn
 from . import indicators as ind
@@ -15,12 +25,28 @@ from . import risk as rk
 from .db import now_iso
 
 FEED_ERRORS = (requests.RequestException, OSError, RuntimeError, ValueError,
-               KeyError, IndexError, TypeError)
+               KeyError, IndexError, TypeError, DecimalException)
 
 
 def _utc(value):
     stamp = pd.Timestamp(value)
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+
+
+def _entry_ready(conn, aid, signal, bar_at, delay_seconds):
+    """Persist intent before a later tick may fill it using newly collected prices."""
+    if delay_seconds <= 0:
+        return True
+    key = f"entry_intent:{aid}"
+    stamp = _utc(now_iso())
+    identity = {"signal": signal, "bar_at": bar_at.isoformat(),
+                "experiment": db.get_runtime_state(conn, "current_experiment")}
+    raw = db.get_runtime_state(conn, key)
+    pending = json.loads(raw) if raw else {}
+    if any(pending.get(k) != v for k, v in identity.items()):
+        db.set_runtime_state(conn, key, json.dumps(dict(identity, at=stamp.isoformat())), commit=False)
+        return False
+    return (stamp - _utc(pending["at"])).total_seconds() >= delay_seconds
 
 
 def _init_account(conn, cfg, *, commit=True):
@@ -153,7 +179,8 @@ def _collect_market(conn, cfg, book_provider=None):
     for pos in positions.values():
         row = conn.execute("SELECT timeframe FROM agents WHERE id=?", (pos.agent_id,)).fetchone()
         pairs.add((pos.symbol, pos.timeframe or (row[0] if row else cfg["timeframe"])))
-    result = {"at": at, "frames": {}, "minutes": {}, "books": {}, "macro": {}, "news": {}}
+    started = time.monotonic()
+    result = {"at": at, "frames": {}, "minutes": {}, "books": {}, "macro": {}, "news": {}, "rules": {}}
     for sym, tf in sorted(pairs):
         try:
             result["frames"][(sym, tf)] = feed.fetch_recent(sym, tf, 400)
@@ -183,12 +210,20 @@ def _collect_market(conn, cfg, book_provider=None):
             result["news"] = news_feed.news_gate(cfg)
         except FEED_ERRORS:
             result["news"] = {"block": cfg["news"].get("fail_closed", False), "unavailable": True}
+    if (cfg.get("execution", {}).get("require_entry_rules", False)
+            or cfg.get("execution", {}).get("partial_exits", False)):
+        for sym in sorted({a["symbol"] for a in agents} | {p.symbol for p in positions.values()}):
+            try:
+                result["rules"][sym] = exchange_rules.entry_rules(sym)
+            except FEED_ERRORS:
+                continue
     if cfg.get("execution", {}).get("use_order_book", False):
         for sym in sorted({sym for sym, _ in pairs}):
             try:
                 result["books"][sym] = (book_provider or market_data.rest_book)(sym)
             except FEED_ERRORS:
                 continue
+    result["collection_seconds"] = time.monotonic() - started
     return result
 
 
@@ -228,7 +263,9 @@ def _tick(conn, cfg, observations):
     positions = _load_positions(conn)
     report = {"at": now.isoformat(), "demo": demo, "issues": [], "entry_reasons": {},
               "quotes": {}, "position_gaps": {}, "partial_entry_minutes": 0,
-              "books": {}, "model_version": core.MODEL_VERSION}
+              "books": {}, "model_version": core.MODEL_VERSION,
+              "collection_seconds": observations.get("collection_seconds", 0),
+              "entry_rules": {}}
     reasons = report["entry_reasons"]
 
     # Baseline is explicit: older history may not contain every cash movement.
@@ -287,6 +324,13 @@ def _tick(conn, cfg, observations):
 
     minute_cache = {}
     execution = cfg.get("execution", {})
+    available_rules = observations.get("rules", {})
+    consumed_book = {}
+    if execution.get("require_entry_rules", False):
+        for sym in {a["symbol"] for a in agents}:
+            report["entry_rules"][sym] = {"available": sym in available_rules}
+            if sym not in available_rules:
+                report["issues"].append(f"exchange_rules_unavailable:{sym}")
     books = {}
     if execution.get("use_order_book", False):
         for sym in {sym for sym, _ in pairs}:
@@ -298,9 +342,16 @@ def _tick(conn, cfg, observations):
                 prices[sym] = (book["bid"] + book["ask"]) / 2
                 report["books"][sym] = {"available": True, "age_seconds": age,
                     "source": book["source"], "spread_bps": (book["ask"] - book["bid"]) / prices[sym] * 10000}
+                if execution.get("record_book_depth", False) and "asks" in book:
+                    conn.execute("INSERT INTO book_observations(ts,symbol,payload) VALUES(?,?,?)",
+                                 (now.isoformat(), sym, json.dumps(book)))
             else:
                 report["books"][sym] = {"available": False}
                 report["issues"].append(f"book_unavailable:{sym}")
+    if execution.get("record_book_depth", False):
+        conn.execute("DELETE FROM book_observations WHERE id <= "
+                     "(SELECT MAX(id)-? FROM book_observations)",
+                     (int(execution.get("book_history_rows", 50000)),))
     max_minutes = int(cfg.get("live", {}).get("max_catchup_minutes", 10080))
     for sym in sorted({p.symbol for p in positions.values()}):
         cursors = [max(_utc(p.last_checked_at or p.opened_at).ceil("min"),
@@ -317,26 +368,87 @@ def _tick(conn, cfg, observations):
             report["issues"].append(f"catchup_truncated:{sym}")
 
     closed_ids = set()
+    attempted_exits = set()
+    report["pending_exits"] = {}
 
     def close_position(pos, reason, price, stamp):
         nonlocal capital
+        if pos.agent_id in attempted_exits:
+            return
+        attempted_exits.add(pos.agent_id)
+        original = pos
+        strict = execution.get("partial_exits", False)
+        intent_key = f"exit_intent:{pos.agent_id}"
+        if strict:
+            db.set_runtime_state(conn, intent_key, json.dumps({"reason": reason, "trigger_at": stamp}), commit=False)
+            try:
+                quote = books.get(pos.symbol)
+                rules = available_rules.get(pos.symbol)
+                if not quote or "asks" not in quote or not 0 <= time.time() - quote["received_at"] <= execution.get("max_quote_age_seconds", 5):
+                    raise ValueError("exit_depth_unavailable")
+                if not rules or not 0 <= time.time() - rules["received_at"] <= execution.get("max_rules_reference_age_seconds", 60):
+                    raise ValueError("exit_rules_unavailable")
+                requested = exchange_rules.market_exit_quantity(pos.units, rules)
+                side = -pos.direction
+                usage_key = f"exit_book_usage:{pos.symbol}:{side}"
+                fingerprint = json.dumps([quote["source"], quote.get("update_id", quote["received_at"])])
+                usage = json.loads(db.get_runtime_state(conn, usage_key, "{}"))
+                used = usage.get("quantity", 0) if usage.get("fingerprint") == fingerprint else 0
+                quantity, fill = core.depth_exit(requested, side, slip, quote,
+                    execution.get("book_participation", .1), used)
+                # The ORDER meets notional minima; an individual execution may be smaller.
+                lot_rules = dict(rules, filters=[f for f in rules["filters"]
+                                                if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE")])
+                quantity = exchange_rules.market_entry_quantity(quantity, lot_rules)
+                quantity, fill = core.depth_exit(quantity, side, slip, quote,
+                    execution.get("book_participation", .1), used)
+                db.set_runtime_state(conn, usage_key, json.dumps({"fingerprint": fingerprint, "quantity": used + quantity}), commit=False)
+                consumed_book[(pos.symbol, side)] = consumed_book.get((pos.symbol, side), 0) + quantity
+                pos = copy.copy(original)
+                ratio = quantity / original.units
+                pos.units, pos.notional = quantity, original.notional * ratio
+                pos.entry_fee = original.entry_fee * ratio if original.entry_fee is not None else None
+                stamp = now_iso()
+            except FEED_ERRORS as exc:
+                state = str(exc) if isinstance(exc, ValueError) else "invalid_exit_rules"
+                report["pending_exits"][str(pos.agent_id)] = {"reason": state, "remaining_qty": pos.units}
+                report["issues"].append(f"pending_exit:{pos.agent_id}:{state}")
+                _save_position(conn, original, commit=False)
+                return
         current_exit = _utc(stamp) >= now
         quote = books.get(pos.symbol) if current_exit else None
         exit_slip = slip
         if execution.get("use_order_book", False) and quote is None:
             exit_slip += execution.get("replay_spread_bps", 10) / 20000
-        fill = core.fill_price(price, -pos.direction, exit_slip, quote=quote)
+        if not strict:
+            fill = core.fill_price(price, -pos.direction, exit_slip, quote=quote)
         settlement = rk.close_pnl(pos, fill, fee)
         net = settlement
         if pos.entry_fee_paid:
             net = settlement - pos.entry_fee if pos.entry_fee is not None else None
         delta = pos.notional + settlement
         capital += delta
-        db.log_paper_trade(conn, pos.agent_id, pos.symbol,
+        trade_id = db.log_paper_trade(conn, pos.agent_id, pos.symbol,
                            "SELL" if pos.direction == 1 else "COVER", fill, pos.units,
                            pos.units * fill * fee, settlement, reason,
                            mode=_position_mode(pos), provenance=_position_provenance(pos),
                            net_pnl=net, cash_delta=delta, ts=stamp, commit=False)
+        remaining = max(0, original.units - pos.units)
+        if strict:
+            # Decimal subtraction preserves legitimate sub-step inventory instead of writing it off.
+            remaining = float(Decimal(str(original.units)) - Decimal(str(pos.units)))
+            conn.execute("INSERT INTO exit_fills VALUES(?,?,?,?)", (trade_id,
+                         f"{pos.agent_id}:{original.opened_at}", int(remaining <= 0), max(0, remaining)))
+        if remaining > 0:
+            original.units = remaining
+            original.notional -= pos.notional
+            if original.entry_fee is not None:
+                original.entry_fee -= pos.entry_fee
+            original.mark_price, original.mark_at = fill, stamp
+            _save_position(conn, original, commit=False)
+            report["pending_exits"][str(pos.agent_id)] = {"reason": "partial_fill", "remaining_qty": remaining}
+            return
+        conn.execute("DELETE FROM runtime_state WHERE key=?", (intent_key,))
         _del_position(conn, pos.agent_id, commit=False)
         del positions[pos.agent_id]
         closed_ids.add(pos.agent_id)
@@ -351,6 +463,11 @@ def _tick(conn, cfg, observations):
 
     # Exits precede entries, and do not depend on an agent being promoted.
     for aid, pos in list(positions.items()):
+        pending = db.get_runtime_state(conn, f"exit_intent:{aid}")
+        if pending and execution.get("partial_exits", False):
+            intent = json.loads(pending)
+            close_position(pos, intent["reason"], prices.get(pos.symbol, pos.mark_price), intent["trigger_at"])
+            continue
         result, gap = _replay_minutes(pos, minute_cache.get(pos.symbol), until, pos.risk_snapshot)
         if gap:
             report["position_gaps"][str(aid)] = gap
@@ -360,6 +477,8 @@ def _tick(conn, cfg, observations):
         frame = data.get((pos.symbol, pos.timeframe))
         if frame is not None:
             price = prices.get(pos.symbol, float(frame["close"].iloc[-1]))
+            if pos.symbol in books:
+                price = books[pos.symbol]["bid" if pos.direction == 1 else "ask"]
             pos.mark_price, pos.mark_at = price, now.isoformat()
             # Current observation can still trigger protection when minute history fails.
             # Do not advance the trailing extreme ahead of the replay cursor.
@@ -398,6 +517,8 @@ def _tick(conn, cfg, observations):
         return capital + sum(p.value(prices.get(p.symbol, p.mark_price)) for p in positions.values())
 
     blocks = []
+    if report["pending_exits"]:
+        blocks.append("pending_exit")
     if cfg.get("runner", {}).get("require_candidate_snapshot", False) and db.get_runtime_state(conn, "candidate_snapshot_ok") != "1":
         blocks.append("candidate_snapshot_unavailable")
     if any(not value["available"] for value in report["books"].values()):
@@ -465,6 +586,8 @@ def _tick(conn, cfg, observations):
                 reason = "no_signal"
             elif blocks:
                 reason = blocks[0]
+            elif execution.get("require_entry_rules", False) and sym not in available_rules:
+                reason = "exchange_rules_unavailable"
             elif dd > risk_cfg.get("max_portfolio_drawdown", 1.0):
                 reason = "drawdown"
             elif sym in locked:
@@ -473,6 +596,8 @@ def _tick(conn, cfg, observations):
                 reason = "symbol_limit"
             elif not rk.can_open(len(positions), risk_cfg):
                 reason = "position_limit"
+            elif not _entry_ready(conn, aid, signal, bar_at, execution.get("min_entry_delay_seconds", 0)):
+                reason = "entry_delay"
             else:
                 price = float(frame["close"].iloc[-1])
                 atr = float(ind.atr(frame, risk_cfg.get("atr_period", 14)).iloc[-1]) if risk_cfg.get("atr_stop") else None
@@ -490,18 +615,42 @@ def _tick(conn, cfg, observations):
                         reason = "insufficient_cash"
                     else:
                         book = books.get(sym)
-                        if book:
-                            available_qty = book["ask_qty" if signal == 1 else "bid_qty"]
-                            invest = min(invest, available_qty * price * execution.get("book_participation", .1))
                         try:
+                            if book and not 0 <= time.time() - book["received_at"] <= execution.get("max_quote_age_seconds", 5):
+                                raise ValueError("book_stale_at_entry")
                             fill = core.fill_price(price, signal, slip, quote=book,
                                                    max_spread=execution.get("max_spread_bps", 20) / 10000)
-                        except ValueError:
-                            reasons["spread_limit"] = reasons.get("spread_limit", 0) + 1
+                            quantity = invest / fill
+                            if book and "asks" in book:
+                                quantity, fill = core.depth_entry(invest, signal, slip, book,
+                                    execution.get("book_participation", .1), consumed_book.get((sym, signal), 0))
+                            elif book:
+                                visible = book["ask_qty" if signal == 1 else "bid_qty"]
+                                remaining = max(0, visible * execution.get("book_participation", .1)
+                                                - consumed_book.get((sym, signal), 0))
+                                quantity = min(quantity, remaining)
+                            if execution.get("require_depth_entries", False) and (not book or "asks" not in book):
+                                raise ValueError("depth_unavailable")
+                            if execution.get("require_entry_rules", False):
+                                rules = available_rules[sym]
+                                if not 0 <= time.time() - rules["received_at"] <= execution.get("max_rules_reference_age_seconds", 60):
+                                    raise ValueError("exchange_rules_stale")
+                                quantity = exchange_rules.market_entry_quantity(quantity, rules)
+                                report["entry_rules"][sym] = {"available": True, "received_at": rules["received_at"],
+                                                              "notional_model": "public_average_approximation"}
+                            if book and "asks" in book:
+                                quantity, fill = core.depth_entry(invest, signal, slip, book,
+                                    execution.get("book_participation", .1), consumed_book.get((sym, signal), 0), quantity)
+                            if quantity <= 0:
+                                raise ValueError("insufficient_book_depth")
+                            invest = quantity * fill
+                        except (ValueError, KeyError, TypeError, DecimalException) as exc:
+                            reason = str(exc) if isinstance(exc, ValueError) else "invalid_exchange_rules"
+                            reasons[reason] = reasons.get(reason, 0) + 1
                             continue
                         rr = risk_cfg.get("fixed_rr", g.get("rr"))
                         take = round(g["stop_atr"] * rr, 3) if g.get("stop_atr") and rr else None
-                        p = rk.Position(aid, sym, fill, invest / fill, direction=signal,
+                        p = rk.Position(aid, sym, fill, quantity, direction=signal,
                                         notional=invest, atr=atr, stop_mult=g.get("stop_atr"),
                                         take_mult=take, trail_mult=g.get("trail_atr"), entry_fee_paid=True)
                         open_risk = sum(max(0, q.direction * (q.mark_price - q._levels(q.risk_snapshot)[0])) * q.units
@@ -518,11 +667,15 @@ def _tick(conn, cfg, observations):
                         delta = -invest - p.entry_fee
                         capital += delta
                         positions[aid] = p
+                        consumed_book[(sym, signal)] = consumed_book.get((sym, signal), 0) + quantity
                         _save_position(conn, p, commit=False)
                         db.log_paper_trade(conn, aid, sym, "BUY" if signal == 1 else "SHORT",
                                            fill, p.units, p.entry_fee, None, "signal", cash_delta=delta,
                                            ts=p.opened_at, commit=False)
                         reason = "opened"
+        if reason not in ("entry_delay", "opened"):
+            # A vanished/blocked signal cancels its old intent, including after restart.
+            conn.execute("DELETE FROM runtime_state WHERE key=?", (f"entry_intent:{aid}",))
         reasons[reason] = reasons.get(reason, 0) + 1
 
     eq = equity_now()

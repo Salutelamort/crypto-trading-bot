@@ -12,6 +12,26 @@ def payload(**changes):
 
 
 class MarketDataTests(unittest.TestCase):
+    def test_required_depth_recovers_via_rest_without_using_top_only_quote(self):
+        stream = market_data.BookStream(["BTCUSDT"], require_depth=True)
+        stream.quotes["BTCUSDT"] = market_data.parse_book(payload(), "test")
+        with mock.patch.object(market_data, "rest_depth", return_value={"depth": True}) as rest:
+            self.assertEqual(stream.book("BTCUSDT"), {"depth": True})
+            rest.assert_called_once_with("BTCUSDT")
+
+    def test_depth_stream_is_sorted_validated_and_copied(self):
+        stream = market_data.BookStream(["BTCUSDT"])
+        payload = {"lastUpdateId": 9, "bids": [["99", "2"], ["98", "3"]],
+                   "asks": [["100", "1"], ["101", "2"]]}
+        stream._message(None, json.dumps({"stream": "btcusdt@depth20@100ms", "data": payload}))
+        quote = stream.book("BTCUSDT")
+        self.assertEqual(quote["update_id"], 9)
+        quote["asks"].clear()
+        self.assertEqual(len(stream.book("BTCUSDT")["asks"]), 2)
+        payload["asks"].reverse()
+        with self.assertRaisesRegex(ValueError, "unordered_depth"):
+            market_data.parse_depth(payload, "test")
+
     def test_rejects_invalid_books(self):
         for data in [None, [], payload(b="nan"), payload(a="inf"),
                      payload(b="102"), payload(A="0"), payload(B="-1")]:

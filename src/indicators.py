@@ -34,13 +34,12 @@ def zscore(series: pd.Series, period: int) -> pd.Series:
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Average True Range — волатильность."""
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    prev_close = df["close"].shift(1).to_numpy(dtype=float)
+    # fmax preserves pandas' skip-NaN row maximum, including the first candle.
+    values = np.fmax(high - low, np.fmax(np.abs(high - prev_close), np.abs(low - prev_close)))
+    tr = pd.Series(values, index=df.index)
     return tr.rolling(period).mean()
 
 

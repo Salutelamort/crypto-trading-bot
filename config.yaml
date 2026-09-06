@@ -41,6 +41,8 @@ history_days: 1095         # 3 года: захватываем РАЗНЫЕ р�
 train_ratio: 0.50          # первая половина данных — in-sample (фитнес отбора)
 test_ratio: 0.50           # вторая половина — validation, делится на окна ниже
 validation:
+  parameter_stability_enabled: true
+  signal_audit_enabled: true # causality and live 400-bar history agreement before admission
   cost_stress_multipliers: [2.0, 3.0] # стратегия должна выдержать повышенные комиссии и проскальзывание
   walk_forward_windows: 4  # на сколько окон режем out-of-sample (устойчивость во времени)
   embargo_bars: 20         # ЗАЗОР между train и test (López de Prado, purged CV):
@@ -48,6 +50,8 @@ validation:
 
 # --- Эволюция (генерация/отбор/убийство агентов) ---
 evolution:
+  evaluation_cache_size: 64
+  anti_clone_loss_corr: 0.85
   population_size: 60       # сколько агентов живо одновременно (~20 у автора)
   generations: 12           # поколений за один запуск (чем больше — тем шире поиск)
   survivors: 12             # сколько лучших выживает в поколении
@@ -105,6 +109,13 @@ costs:
 # по сигналу происходит с задержкой: реагируем на УЖЕ ЗАКРЫТЫЙ бар, а не на текущий.
 # Если стратегия работает только при мгновенном исполнении — она отсеется при отборе.
 execution:
+  require_entry_rules: true # public current spot quantity/notional constraints for new entries
+  max_rules_reference_age_seconds: 60
+  min_entry_delay_seconds: 1 # persisted intent; fresh quote and risk checks on a later tick
+  record_book_depth: true
+  require_depth_entries: true
+  partial_exits: true # fresh depth and current rules; unresolved inventory stays on account
+  book_history_rows: 50000 # bounded rolling snapshot archive, not a full tick recording
   use_order_book: true
   use_websocket: true
   max_quote_age_seconds: 5
@@ -119,6 +130,7 @@ execution:
 # --- Пороги ОТБОРА (решает эволюция, без LLM) ---
 # Это "ворота допуска" к живой торговле и правила смерти агентов.
 supervisor:
+  require_signal_audit: true
   min_dsr_probability: 0.95
   require_current_model: true
   require_cost_stress: true

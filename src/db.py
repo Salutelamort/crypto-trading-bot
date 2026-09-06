@@ -112,6 +112,20 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS book_observations (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS exit_fills (
+    trade_id INTEGER PRIMARY KEY REFERENCES paper_trades(id),
+    position_key TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    remaining_qty REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS equity_samples (
     experiment_id TEXT NOT NULL,
     ts TEXT NOT NULL,
@@ -182,7 +196,7 @@ def _migrate(conn):
     for col in ("test_buyhold", "test_alpha", "test_sortino", "test_calmar", "test_pf"):
         if col not in cols:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} REAL")
-    for col, spec in (("return_stats", "TEXT"), ("model_version", "TEXT"),
+    for col, spec in (("return_stats", "TEXT"), ("model_version", "TEXT"), ("signal_audit", "TEXT"),
                       ("stress_return", "REAL"), ("stress_pf", "REAL")):
         if col not in cols:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {spec}")
@@ -313,9 +327,9 @@ def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consisten
     # Сворачиваем испытание в компактную память (один агент = одно испытание).
     # count_trial=False — при ПЕРЕОЦЕНКЕ уже существующего агента (не новое
     # испытание, счётчик Deflated Sharpe раздувать нельзя).
-    conn.execute("UPDATE agents SET return_stats=?,model_version=?,stress_return=?,stress_pf=? WHERE id=?",
+    conn.execute("UPDATE agents SET return_stats=?,model_version=?,stress_return=?,stress_pf=?,signal_audit=? WHERE id=?",
                  (json.dumps(test.get("return_stats")), test.get("model_version"),
-                  test.get("stress_return"), test.get("stress_pf"), agent_id))
+                  test.get("stress_return"), test.get("stress_pf"), json.dumps(test.get("signal_audit")), agent_id))
     row = conn.execute("SELECT genome, symbol, timeframe FROM agents WHERE id=?",
                        (agent_id,)).fetchone()
     if row is not None and count_trial:

@@ -134,7 +134,7 @@ def _status_from_connection(conn, *, external_data=True):
     recent_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE mode IN ('live','legacy') "
         "ORDER BY id DESC LIMIT 30").fetchall()
-    net_by_id = {t["id"]: t["net_pnl"] for t in execution_report.trade_results(conn)}
+    net_by_id = {t["id"]: t["net_pnl"] for t in execution_report.trade_results(conn, aggregate=False)}
     for t in recent_trades:
         out["trades"].append({
             "ts": t["ts"][11:19], "agent_id": t["agent_id"], "symbol": t["symbol"],
@@ -358,6 +358,10 @@ async function refresh(){
     no_signal:'нет сигнала',data_unavailable:'неполные рыночные данные',ledger_mismatch:'расхождение учёта',macro:'макро-фильтр',
     news:'новостной фильтр',stoploss_guard:'серия убытков',drawdown:'лимит просадки',
     symbol_lock:'символ заблокирован',symbol_limit:'лимит на символ',position_limit:'лимит позиций',
+    pending_exit:'ожидается завершение выхода',partial_fill:'частичное исполнение',
+    below_min_quantity:'остаток меньше минимального количества',below_min_notional:'остаток меньше минимальной суммы',
+    exit_depth_unavailable:'нет свежего стакана для выхода',exit_rules_unavailable:'нет свежих правил для выхода',
+    insufficient_exit_depth:'доступный объём уже использован',
     invalid_atr:'некорректный ATR',insufficient_cash:'недостаточно кэша',opened:'открыто'};
   $('#experiment-id').textContent='Текущий эксперимент: '+(ex.current_experiment||'—');
   const freshness=health.age_seconds==null?'Нет данных о выполнении':
@@ -369,7 +373,9 @@ async function refresh(){
   const quotes=Object.entries(health.quotes||{}).map(([k,v])=>k+': '+
     (v.available?'отставание свечей '+Math.floor(v.age_seconds||0)+' с':'нет свежих данных')).join(' · ');
   const gaps=Object.entries(health.position_gaps||{}).map(([k,v])=>'Позиция #'+k+': '+v).join(' · ');
-  $('#execution-health').textContent=[freshness,reconciliation,entries,quotes,gaps,
+  const pendingExits=Object.entries(health.pending_exits||{}).map(([k,v])=>
+    'Выход #'+k+': '+(labels[v.reason]||v.reason)+' · осталось '+num(v.remaining_qty,8)).join('\n');
+  $('#execution-health').textContent=[freshness,reconciliation,entries,quotes,gaps,pendingExits,
     (health.issues||[]).join(' · ')].filter(Boolean).join('\n');
   $('#forward-trials').textContent=(d.forward_trials||[]).map(t=>{
     const e=t.evidence||{};
