@@ -14,6 +14,7 @@ import tarfile
 import threading
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -93,11 +94,11 @@ def claim_writer(data_dir):
 
 
 def authorized(auth_header, route, password, user="owner"):
-    """HTTP Basic gate for a publicly exposed panel. `/health` stays open so the
-    platform health check works; everything else needs the password once it is
-    set. No password set => open (kept for private/internal deployments)."""
-    if not password or route == "/health":
+    """Only operational checks are public; data routes require a configured password."""
+    if route in ("/health", "/monitor"):
         return True
+    if not password:
+        return False
     if not auth_header or not auth_header.startswith("Basic "):
         return False
     try:
@@ -110,6 +111,32 @@ def authorized(auth_header, route, password, user="owner"):
     # constant-time compare avoids leaking the password via timing
     return (hmac.compare_digest(got_user, user)
             and hmac.compare_digest(got_pass, password))
+
+
+def monitor_payload(data_dir, status, now=None):
+    """Public operational booleans only: never expose balances, strategies or keys."""
+    now = now or datetime.now(timezone.utc)
+    checks = {"process": status.get("phase") == "running", "paper_mode": status.get("real_orders_enabled") is False,
+              "heartbeat": False, "market_data": False, "ledger": False, "research": False,
+              "backup": status.get("backup") == "ok"}
+    age = None
+    try:
+        snapshot = json.loads((data_dir / "latest.json").read_text(encoding="utf-8"))
+        health = snapshot["execution_health"]
+        age = (now - datetime.fromisoformat(health["at"])).total_seconds()
+        checks["heartbeat"] = 0 <= age <= 180
+        checks["market_data"] = (all(q.get("available") is True for q in health.get("quotes", {}).values())
+                                 and all(q.get("available") is True for q in health.get("books", {}).values())
+                                 and not health.get("position_gaps"))
+        checks["ledger"] = snapshot.get("cash_reconciliation", {}).get("ok") is True
+        research = json.loads((data_dir / "research-report.json").read_text(encoding="utf-8"))
+        research_age = (now - datetime.fromisoformat(research["updated_at"])).total_seconds()
+        checks["research"] = (research.get("status") in ("running", "success") and 0 <= research_age <= 28800
+                              and status.get("research") not in ("timeout", "failed_retry_pending"))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass  # Missing/invalid evidence is unhealthy, never a successful empty response.
+    return {"schema_version": 1, "ok": all(checks.values()), "checked_at": now.isoformat(),
+            "heartbeat_age_seconds": age, "checks": checks}
 
 
 def make_handler(data_dir, status, password="", user="owner"):
@@ -131,6 +158,10 @@ def make_handler(data_dir, status, password="", user="owner"):
                 payload = {"mode": "paper", **status}
                 body = json.dumps(payload).encode()
                 code = 200 if status["phase"] in ("standby", "running") else 503
+            elif route == "/monitor":
+                payload = monitor_payload(data_dir, status)
+                body = json.dumps(payload, allow_nan=False).encode()
+                code = 200 if payload["ok"] else 503
             elif route == "/":
                 from dashboard import HTML
 
@@ -193,8 +224,7 @@ def main():
     panel_password = os.environ.get("DASHBOARD_PASSWORD", "")
     panel_user = os.environ.get("DASHBOARD_USER", "owner")
     if not panel_password:
-        print("WARNING: DASHBOARD_PASSWORD not set — panel is OPEN. Set it before "
-              "creating a public Railway domain.", flush=True)
+        print("Dashboard password absent: private data routes locked; operational checks remain available.", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))),
                                  make_handler(data_dir, status, panel_password, panel_user))
     server.daemon_threads = True

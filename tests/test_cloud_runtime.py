@@ -84,8 +84,8 @@ class CloudRuntimeTests(unittest.TestCase):
 
         good = "Basic " + base64.b64encode(b"owner:s3cret").decode()
         wrong = "Basic " + base64.b64encode(b"owner:nope").decode()
-        # no password configured => panel open (private/internal deployment)
-        self.assertTrue(cloud_runtime.authorized(None, "/api/summary", ""))
+        # Data routes remain locked even when the password is absent.
+        self.assertFalse(cloud_runtime.authorized(None, "/api/summary", ""))
         # password set: health stays open, data routes require correct credentials
         self.assertTrue(cloud_runtime.authorized(None, "/health", "s3cret"))
         self.assertFalse(cloud_runtime.authorized(None, "/api/summary", "s3cret"))

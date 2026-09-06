@@ -1,0 +1,24 @@
+name: external-bot-monitor
+
+on:
+  schedule:
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-bot-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check external operational endpoint
+        env:
+          BOT_MONITOR_URL: ${{ vars.BOT_MONITOR_URL }}
+        run: python3 scripts/external_monitor.py
