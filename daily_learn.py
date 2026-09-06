@@ -17,6 +17,7 @@ import datetime
 import json
 import os
 import time
+from pathlib import Path
 
 import yaml
 
@@ -28,6 +29,7 @@ from src import (
     live_trade,
     macro_feed,
     news_feed,
+    research_report,
     supervisor,
 )
 from src import data_feed as feed
@@ -103,6 +105,20 @@ def main():
     if args.db_path:
         cfg["db_path"] = args.db_path
     conn = db.connect(cfg["db_path"])
+    report = research_report.ResearchReport(Path(args.candidate_path).parent)
+    report.save()
+    try:
+        _learn(conn, cfg, args, report)
+    except BaseException:
+        report.save("failed")
+        raise
+    else:
+        report.save("success")
+    finally:
+        conn.close()
+
+
+def _learn(conn, cfg, args, report):
 
     # бюджет времени на один облачный прогон (минут). Репо публичный → минуты
     # бесплатны, поэтому за один слот делаем несколько циклов эволюции "пачкой".
@@ -111,23 +127,34 @@ def main():
 
     print(f"== Автообучение (пачка, бюджет {budget_min} мин) ==")
     timeframes = cfg.get("timeframes", [cfg["timeframe"]])
-    feed.fetch_all(conn, cfg["symbols"], timeframes, cfg["history_days"])
-    data = feed.load_all(conn, cfg["symbols"], timeframes)   # ключ (symbol, timeframe)
+    with report.stage("market_data_download"):
+        feed.fetch_all(conn, cfg["symbols"], timeframes, cfg["history_days"])
+    with report.stage("market_data_load"):
+        data = feed.load_all(conn, cfg["symbols"], timeframes)
+    report.counters["datasets"] = len(data)
+    report.counters["candles"] = sum(len(frame) for frame in data.values())
 
     # Цикл: эволюция накапливает и улучшает популяцию (рождение/смерть внутри неё).
     # Журнал пишем НЕ каждый цикл (это плодило десятки почти одинаковых строк за
     # прогон), а один раз в конце прогона — после тика.
     cycles = 0
     while True:
-        evolution.evolve(conn, cfg, data)
+        evolution.evolve(conn, cfg, data, report=report)
         cycles += 1
+        report.counters["cycles"] = cycles
+        report.save()
         if time.time() >= deadline:
             break
 
     # Гигиена пула: освежить OOS-метрики допущенных (иначе они замирают на
     # момент допуска), затем отбор с демоцией + один тик бумажной торговли.
-    evolution.reevaluate_promoted(conn, cfg, data)
-    supervisor.supervise(conn, cfg)
+    with report.stage("promoted_reevaluation"):
+        report.counters["promoted_reevaluated"] = evolution.reevaluate_promoted(conn, cfg, data)
+    first_decision = conn.execute("SELECT COALESCE(MAX(id),0) FROM decisions").fetchone()[0]
+    with report.stage("supervisor"):
+        supervisor.supervise(conn, cfg)
+    for row in conn.execute("SELECT action,COUNT(*) n FROM decisions WHERE id>? GROUP BY action", (first_decision,)):
+        report.counters["supervisor_" + row["action"]] += row["n"]
     if args.research_only:
         candidate_exchange.export_snapshot(conn, cfg, args.candidate_path)
     else:
@@ -147,7 +174,6 @@ def main():
     da, dd = db.prune_history(conn, keep_killed=3000, keep_decisions=8000)
     print(f"Retention: убрано killed-агентов {da}, старых решений {dd}")
     conn.execute("PRAGMA optimize")
-    conn.close()
 
 
 if __name__ == "__main__":

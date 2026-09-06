@@ -215,6 +215,11 @@ runner:
   candidate_path: state/candidates.json
   candidate_max_age_hours: 24
 
+reconciliation:
+  enabled: true
+  max_bars: 10000
+  report_interval_seconds: 300
+
 forward:
   enabled: true
   max_active_trials: 4

@@ -135,8 +135,10 @@ def make_handler(data_dir, status, password="", user="owner"):
                 from dashboard import HTML
 
                 body, mime = HTML.encode("utf-8"), "text/html; charset=utf-8"
-            elif route in ("/api/status", "/api/summary"):
-                file = data_dir / ("dashboard.json" if route == "/api/status" else "latest.json")
+            elif route in ("/api/status", "/api/summary", "/api/research-report", "/api/reconciliation"):
+                file = data_dir / {"/api/status": "dashboard.json", "/api/summary": "latest.json",
+                                   "/api/research-report": "research-report.json",
+                                   "/api/reconciliation": "reconciliation.json"}[route]
                 if file.exists():
                     payload = json.loads(file.read_text(encoding="utf-8"))
                     # Snapshot age must grow even when the paper child has stalled.

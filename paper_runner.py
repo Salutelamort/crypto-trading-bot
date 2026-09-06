@@ -15,6 +15,7 @@ from src import (
     forward_trials,
     live_trade,
     market_data,
+    replay_report,
 )
 
 
@@ -69,6 +70,19 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
     forward_trials.enroll(conn, cfg)
     forward_trials.tick_all(conn, book_provider)
     write_summary(conn, cfg, state_path)
+    if cfg.get("reconciliation", {}).get("enabled", False):
+        target = Path(state_path).parent / "reconciliation.json"
+        if not target.exists() or time.time() - target.stat().st_mtime >= cfg["reconciliation"].get("report_interval_seconds", 300):
+            try:
+                report_data = replay_report.build(conn)
+                temp = target.with_suffix(".tmp")
+                temp.write_text(json.dumps(report_data, allow_nan=False), encoding="utf-8")
+                temp.replace(target)
+                print("RECONCILIATION_REPORT " + json.dumps({"updated_at": report_data["updated_at"],
+                    "runs": [{k: r[k] for k in ("run_id", "status", "matched_orders", "missing_paper_orders",
+                             "signal_mismatch_count") if k in r} for r in report_data["runs"]]}), flush=True)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                print(f"RECONCILIATION_REPORT_FAILED {type(exc).__name__}; retry next tick", flush=True)
     return report
 
 

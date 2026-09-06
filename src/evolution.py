@@ -18,6 +18,7 @@
 import copy
 import json
 import random
+from contextlib import nullcontext
 
 import pandas as pd
 
@@ -210,7 +211,7 @@ def _anti_clone(conn, cfg, data_by_key):
     return killed
 
 
-def evolve(conn, cfg, data_by_key):
+def evolve(conn, cfg, data_by_key, report=None):
     """
     data_by_key: {(symbol, timeframe): DataFrame OHLCV}
     МУЛЬТИТАЙМФРЕЙМ: таймфрейм — часть генома, эволюция ищет лучший под стратегию.
@@ -257,11 +258,19 @@ def evolve(conn, cfg, data_by_key):
         for g in new_genomes:
             key = (g["symbol"], g["timeframe"])
             if key not in data_by_key:
+                if report:
+                    report.counters["missing_dataset"] += 1
                 continue
             df = data_by_key[key]
             if len(df) < 400:
+                if report:
+                    report.counters["insufficient_history"] += 1
                 continue
-            train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate)
+            hits = cache.hits
+            with report.stage("candidate_evaluation") if report else nullcontext():
+                train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate)
+            if report:
+                report.evaluation(g, train_m, test_m, cache.hits > hits)
             aid = db.insert_agent(conn, g, g["symbol"], g["timeframe"])
             db.update_agent_metrics(conn, aid, train_m, test_m, cons)
 
@@ -273,6 +282,8 @@ def evolve(conn, cfg, data_by_key):
             if a["id"] in keep_ids:
                 continue
             db.set_agent_status(conn, a["id"], "killed")
+            if report:
+                report.counters["evolution_rejections"] += 1
             reason = (f"мало сделок ({a['train_trades']} < {min_tr})"
                       if (a["train_trades"] or 0) < min_tr
                       else f"train_sharpe {a['train_sharpe']} вне топ-{ev['survivors']} (с квотой на символ)")
@@ -280,7 +291,10 @@ def evolve(conn, cfg, data_by_key):
                             f"эволюционный отбор: {reason}")
 
         # 4. Анти-клон фильтр (по реальной корреляции дохода → диверсификация).
-        cloned = _anti_clone(conn, cfg, data_by_key)
+        with report.stage("correlation_filter") if report else nullcontext():
+            cloned = _anti_clone(conn, cfg, data_by_key)
+        if report:
+            report.counters["correlated_rejections"] += cloned
 
         survivors_now = db.get_agents(conn, "candidate")
         print(f"  Живых агентов: {len(survivors_now)} | убито клонов: {cloned}")

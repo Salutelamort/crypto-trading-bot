@@ -126,6 +126,20 @@ CREATE TABLE IF NOT EXISTS exit_fills (
     remaining_qty REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS replay_runs (
+    id TEXT PRIMARY KEY,
+    agent_id INTEGER NOT NULL,
+    experiment_id TEXT NOT NULL,
+    state TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replay_decisions (
+    run_id TEXT NOT NULL,
+    bar_at TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(run_id,bar_at)
+);
+
 CREATE TABLE IF NOT EXISTS equity_samples (
     experiment_id TEXT NOT NULL,
     ts TEXT NOT NULL,

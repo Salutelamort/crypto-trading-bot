@@ -23,7 +23,8 @@ _effective_risk = core.effective_risk
 _exit_levels = core.exit_levels
 
 
-def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=True) -> dict:
+def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=True,
+        trade_start=None, record_orders=False) -> dict:
     """
     Симулирует одного агента на исторических данных. Поддерживает ТРИ состояния:
     long (+1), short (-1), кэш (0). Возвращает словарь метрик + кривую equity.
@@ -66,6 +67,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     period_returns = []
     trade_results = []
     trade_log = []
+    order_log = []
     entry_index = 0
     prev_equity = cash
     cooldown_until = 0    # до этого бара новые входы запрещены (анти-переторговля)
@@ -76,6 +78,11 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
         gross = direction * (exit_exec / entry_exec - 1)      # доходность с учётом стороны
         pnl = notional * gross - notional * (exit_exec / entry_exec) * fee
         net_pnl = pnl - notional * fee
+        if record_orders:
+            quantity = notional / entry_exec
+            order_log.append({"bar_at": df.index[i].isoformat(), "side": "SELL" if direction == 1 else "COVER",
+                              "price": exit_exec, "qty": quantity, "fee": quantity * exit_exec * fee,
+                              "reason": reason})
         trade_results.append(net_pnl)
         if record_trades:
             trade_log.append({"entry_at": df.index[entry_index].isoformat(),
@@ -90,6 +97,8 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     for i in range(n):
         price = close[i]
         s = int(sig_arr[i])
+        if trade_start is not None and df.index[i] < pd.Timestamp(trade_start):
+            s = 0
         closed_this_bar = False
 
         # --- управление открытой позицией: риск приоритетнее сигнала ---
@@ -116,6 +125,10 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
             notional = min(cash * frac_eff, cash / (1 + fee))
             cash -= notional + notional * fee
             entry_exec = core.fill_price(price, direction, slip)
+            if record_orders:
+                order_log.append({"bar_at": df.index[i].isoformat(), "side": "BUY" if direction == 1 else "SHORT",
+                                  "price": entry_exec, "qty": notional / entry_exec,
+                                  "fee": notional * fee, "reason": "signal"})
             # Вход исполняется на close; high/low этой свечи уже в прошлом.
             extreme = entry_exec
             atr_entry = atr_arr[i] if atr_arr[i] is not None else None
@@ -141,6 +154,8 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     m["trade_details_recorded"] = record_trades
     m["return_stats"] = mt.return_statistics(rets)
     m["model_version"] = core.MODEL_VERSION
+    if record_orders:
+        m["orders"] = order_log
     return m
 
 

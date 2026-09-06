@@ -17,6 +17,7 @@ from . import (
     market_data,
     news_feed,
     protections,
+    replay_report,
 )
 from . import execution_core as core
 from . import genome as gn
@@ -368,6 +369,7 @@ def _tick(conn, cfg, observations):
             report["issues"].append(f"catchup_truncated:{sym}")
 
     closed_ids = set()
+    replay_report.capture(conn, cfg, agents, data, set(positions), now)
     attempted_exits = set()
     report["pending_exits"] = {}
 
@@ -561,6 +563,7 @@ def _tick(conn, cfg, observations):
 
     for a in agents:
         aid, sym, tf = a["id"], a["symbol"], a["timeframe"]
+        signal = None
         if aid in positions:
             reason = "position_open"
         elif aid in closed_ids:
@@ -647,6 +650,7 @@ def _tick(conn, cfg, observations):
                         except (ValueError, KeyError, TypeError, DecimalException) as exc:
                             reason = str(exc) if isinstance(exc, ValueError) else "invalid_exchange_rules"
                             reasons[reason] = reasons.get(reason, 0) + 1
+                            replay_report.record_decision(conn, cfg, aid, frame, signal, reason)
                             continue
                         rr = risk_cfg.get("fixed_rr", g.get("rr"))
                         take = round(g["stop_atr"] * rr, 3) if g.get("stop_atr") and rr else None
@@ -658,6 +662,7 @@ def _tick(conn, cfg, observations):
                         new_risk = max(0, signal * (fill - p._levels(risk_cfg)[0])) * p.units + 2 * invest * fee
                         if open_risk + new_risk > eq * risk_cfg.get("max_total_stop_risk", 1.0):
                             reasons["portfolio_risk_limit"] = reasons.get("portfolio_risk_limit", 0) + 1
+                            replay_report.record_decision(conn, cfg, aid, frame, signal, "portfolio_risk_limit")
                             continue
                         # Record actual entry time, after all network collection.
                         p.opened_at = now_iso()
@@ -677,6 +682,7 @@ def _tick(conn, cfg, observations):
             # A vanished/blocked signal cancels its old intent, including after restart.
             conn.execute("DELETE FROM runtime_state WHERE key=?", (f"entry_intent:{aid}",))
         reasons[reason] = reasons.get(reason, 0) + 1
+        replay_report.record_decision(conn, cfg, aid, data.get((sym, tf)), signal, reason)
 
     eq = equity_now()
     peak = max(peak, eq)
