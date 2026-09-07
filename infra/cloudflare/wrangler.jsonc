@@ -1,0 +1,12 @@
+{
+  "name": "trading-paper-observer",
+  "main": "monitor.mjs",
+  "compatibility_date": "2026-09-07",
+  "account_id": "328f7c71cafff5348104d76c39807458",
+  "workers_dev": true,
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": {
+    "BOT_MONITOR_URL": "https://trading-paper-production-64fe.up.railway.app/monitor"
+  },
+  "kv_namespaces": [{ "binding": "STATE", "id": "ca9f6c3bbd8c4801b5d42f82822094a1" }]
+}

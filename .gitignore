@@ -10,6 +10,9 @@ scratchpad/
 # Секреты (ключи API и т.п.) — никогда в репозиторий
 secrets.local.json
 *.key
+.wrangler/
+.dev.vars
+.dev.vars.*
 
 # Экспорты чатов
 messages*.html

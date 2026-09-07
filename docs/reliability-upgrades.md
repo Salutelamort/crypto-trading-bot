@@ -15,8 +15,8 @@ The first release exposing a contract needs a manually reviewed deployment. Auto
 
 ## Still pending
 
-- Cloudflare authentication expired before authorization completed. No Cloudflare scheduler or external backup storage has been provisioned.
-- Offsite backup upload, independent restore validation and independent scheduled monitoring remain unconnected. Current backups remain on the Railway volume; GitHub scheduled monitoring remains active with its existing scheduling limitations.
+- Cloudflare authentication succeeded. The independent Worker scheduler has been deployed; configuration and notification setup are in `infra/cloudflare/README.md`.
+- R2 is not activated (API error 10042). Offsite backup upload and independent restore validation remain unconnected. Current backups remain on the Railway volume; GitHub scheduled monitoring remains active with its existing scheduling limitations.
 - Cloudflare-triggered GitHub notifications need a narrowly scoped credential or GitHub App integration. Do not copy a broad personal GitHub token into a Worker.
 - Cost-stress evidence currently supplies a report only. Applying it to future research requires a separate versioned calibration policy; it must never silently lower costs or weaken validation.
 

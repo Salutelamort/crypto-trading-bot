@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '3-58/5 * * * *'
   workflow_dispatch:
+    inputs:
+      external_incident:
+        description: Cloudflare observed repeated failures
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,11 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
+      - name: Preserve external incident notification even if service recovered
+        if: ${{ inputs.external_incident == true }}
+        run: |
+          echo '::error::Cloudflare independently observed repeated failed bot checks. Inspect observer status and Railway logs.'
+          exit 1
       - name: Check external operational endpoint
         env:
           BOT_MONITOR_URL: ${{ vars.BOT_MONITOR_URL }}
