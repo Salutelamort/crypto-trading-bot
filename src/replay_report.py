@@ -5,12 +5,27 @@ assumptions. Differences are diagnostics, never a reason to bypass trading gates
 """
 import io
 import json
+import math
 from collections import Counter
 
 import pandas as pd
 
 from . import backtest, db, genome
 from .data_feed import _TF_MS
+
+
+def cost_evidence(matches, *, data_gaps=0, signal_mismatches=0):
+    """Conservative stress evidence, never an estimate of real exchange slippage."""
+    values = [float(m["adverse_price_bps"]) for m in matches]
+    days = len({m["bar_at"][:10] for m in matches})
+    valid = all(math.isfinite(v) for v in values)
+    ready = len(values) >= 30 and days >= 7 and not data_gaps and not signal_mismatches and valid
+    return {"status": "ready" if ready else "insufficient_or_invalid_evidence",
+            "matched_orders": len(values), "distinct_days": days,
+            "minimum_orders": 30, "minimum_days": 7,
+            "additional_stress_bps": max(0.0, sorted(values)[math.ceil(.95 * len(values)) - 1]) if ready else None,
+            "scope": "candle_to_paper_gap_not_real_exchange_slippage",
+            "automatic_cost_reduction_allowed": False}
 
 
 def capture(conn, cfg, agents, frames, initially_open, at):
@@ -127,6 +142,7 @@ def compare(state, decisions, actual):
                   reference_orders=len(reference["orders"]), matched_orders=len(matches),
                   missing_paper_orders=len(missing), unmatched_paper_groups=len(live),
                   matches=matches[-50:], missing=missing[-50:], decision_reasons=dict(reasons))
+    result["cost_evidence"] = cost_evidence(matches, data_gaps=gaps, signal_mismatches=len(mismatches))
     return result
 
 

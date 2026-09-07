@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from src.release_contract import describe
+
 ROOT = Path(__file__).resolve().parent
 STATE_URL = "https://github.com/Salutelamort/crypto-trading-bot/releases/download/bot-state/bot-state.tar.gz"
 
@@ -135,8 +137,14 @@ def monitor_payload(data_dir, status, now=None):
                               and status.get("research") not in ("timeout", "failed_retry_pending"))
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass  # Missing/invalid evidence is unhealthy, never a successful empty response.
+    contract = None
+    try:
+        contract = describe(ROOT, data_dir / "bot.db")
+    except (OSError, sqlite3.Error):
+        pass
     return {"schema_version": 1, "ok": all(checks.values()), "checked_at": now.isoformat(),
-            "heartbeat_age_seconds": age, "checks": checks}
+            "heartbeat_age_seconds": age, "checks": checks,
+            "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID"), "release_contract": contract}
 
 
 def make_handler(data_dir, status, password="", user="owner"):

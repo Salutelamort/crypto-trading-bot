@@ -33,6 +33,7 @@ from src import (
     supervisor,
 )
 from src import data_feed as feed
+from src.evaluation_cache import EvaluationCache
 
 CSV_PATH = "TRACK_RECORD.csv"
 HEADER = ["date", "equity", "capital", "open_positions",
@@ -138,10 +139,14 @@ def _learn(conn, cfg, args, report):
     # Журнал пишем НЕ каждый цикл (это плодило десятки почти одинаковых строк за
     # прогон), а один раз в конце прогона — после тика.
     cycles = 0
+    cache = EvaluationCache(cfg["evolution"].get("evaluation_cache_size", 64),
+                            cfg["evolution"].get("evaluation_cache_mb", 32) * 1024 * 1024)
     while True:
-        evolution.evolve(conn, cfg, data, report=report)
+        evolution.evolve(conn, cfg, data, report=report, cache=cache)
         cycles += 1
         report.counters["cycles"] = cycles
+        report.counters["cache_retained_bytes"] = cache.bytes
+        report.counters["cache_retained_results"] = len(cache.values)
         report.save()
         if time.time() >= deadline:
             break
@@ -149,7 +154,7 @@ def _learn(conn, cfg, args, report):
     # Гигиена пула: освежить OOS-метрики допущенных (иначе они замирают на
     # момент допуска), затем отбор с демоцией + один тик бумажной торговли.
     with report.stage("promoted_reevaluation"):
-        report.counters["promoted_reevaluated"] = evolution.reevaluate_promoted(conn, cfg, data)
+        report.counters["promoted_reevaluated"] = evolution.reevaluate_promoted(conn, cfg, data, cache=cache)
     first_decision = conn.execute("SELECT COALESCE(MAX(id),0) FROM decisions").fetchone()[0]
     with report.stage("supervisor"):
         supervisor.supervise(conn, cfg)

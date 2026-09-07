@@ -50,7 +50,8 @@ validation:
 
 # --- Эволюция (генерация/отбор/убийство агентов) ---
 evolution:
-  evaluation_cache_size: 64
+  evaluation_cache_size: 512
+  evaluation_cache_mb: 32 # shared across cycles; bounded to avoid starving the paper process
   anti_clone_loss_corr: 0.85
   population_size: 60       # сколько агентов живо одновременно (~20 у автора)
   generations: 12           # поколений за один запуск (чем больше — тем шире поиск)

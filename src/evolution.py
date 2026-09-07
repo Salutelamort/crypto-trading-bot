@@ -76,7 +76,7 @@ def _evaluate(genome, df, cfg):
     return train, test, consistency
 
 
-def reevaluate_promoted(conn, cfg, data_by_key):
+def reevaluate_promoted(conn, cfg, data_by_key, cache=None):
     """ГИГИЕНА ПУЛА, шаг 1: освежить OOS-метрики допущенных агентов на свежих
     данных (walk-forward, та же оценка, что при рождении). Без этого метрики
     promoted замирают на момент допуска, и протухший агент живёт вечно.
@@ -91,7 +91,7 @@ def reevaluate_promoted(conn, cfg, data_by_key):
         df = data_by_key.get(key)
         if df is None or len(df) < 400:
             continue
-        train_m, test_m, cons = _evaluate(g, df, cfg)
+        train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate) if cache is not None else _evaluate(g, df, cfg)
         db.update_agent_metrics(conn, a["id"], train_m, test_m, cons,
                                 count_trial=False)
         done += 1
@@ -211,7 +211,7 @@ def _anti_clone(conn, cfg, data_by_key):
     return killed
 
 
-def evolve(conn, cfg, data_by_key, report=None):
+def evolve(conn, cfg, data_by_key, report=None, cache=None):
     """
     data_by_key: {(symbol, timeframe): DataFrame OHLCV}
     МУЛЬТИТАЙМФРЕЙМ: таймфрейм — часть генома, эволюция ищет лучший под стратегию.
@@ -222,7 +222,8 @@ def evolve(conn, cfg, data_by_key, report=None):
     # (бег на месте). Теперь seed случайный — пространство стратегий реально
     # исследуется от прогона к прогону. Выжившие накапливаются в БД (эволюция).
     ev = cfg["evolution"]
-    cache = EvaluationCache(ev.get("evaluation_cache_size", 64))
+    if cache is None:
+        cache = EvaluationCache(ev.get("evaluation_cache_size", 64), ev.get("evaluation_cache_mb", 32) * 1024 * 1024)
     rng = random.Random(ev.get("seed"))
     quarantined = db.quarantined_symbols(conn)
     # доступные пары (символ, таймфрейм): есть данные и символ не в карантине
