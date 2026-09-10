@@ -37,6 +37,7 @@ def diagnostics(conn, cfg):
         nonzero = next((stamp for stamp, value in signals if any(s != 0 for s in value["signals"])), None)
         observations.append({"agent_id": agent["id"], "symbol": agent["symbol"], "timeframe": agent["timeframe"],
             "status": agent["status"], "admission_reasons": admission_reasons(agent, cfg),
+            "model_version": agent.get("model_version"),
             "test_trades": agent.get("test_trades"), "test_return": agent.get("test_return"),
             "test_pf": agent.get("test_pf"), "last_observed_bar": signals[0][0] if signals else None,
             "last_observed_signals": signals[0][1]["signals"] if signals else [],
@@ -44,6 +45,9 @@ def diagnostics(conn, cfg):
             "signal_observation_status": "recorded" if signals else "not_observed",
             "signal_history_limit_bars": 1000})
     return {"updated_at": db.now_iso(), "enabled": cfg.get("forward", {}).get("enabled", False),
+            "candidate_snapshot_ok": db.get_runtime_state(conn, "candidate_snapshot_ok") == "1",
+            "candidate_snapshot_failure": db.get_runtime_state(conn, "candidate_snapshot_failure"),
+            "expected_model_version": MODEL_VERSION,
             "active_trials": active, "capacity": cfg.get("forward", {}).get("max_active_trials", 4),
             "candidate_count": len(candidates), "candidates": observations}
 

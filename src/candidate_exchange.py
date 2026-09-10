@@ -17,6 +17,20 @@ def policy_hash(cfg):
 def export_snapshot(conn, cfg, path):
     agents = [a for a in db.get_agents(conn) if a["status"] in ("promoted", "candidate")
               and a.get("model_version") == MODEL_VERSION]
+    # An obsolete candidate must not poison the complete snapshot for the reader.
+    eligible = []
+    for agent in agents:
+        try:
+            g = json.loads(agent["genome"])
+            valid = (genome.validate_genome(g)[0] and g["symbol"] == agent["symbol"]
+                     and g["timeframe"] == agent["timeframe"] and g["symbol"] in cfg["symbols"]
+                     and g["timeframe"] in cfg.get("timeframes", [cfg["timeframe"]]))
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if valid:
+            eligible.append(agent)
+    excluded = len(agents) - len(eligible)
+    agents = eligible
     families = db.trial_family_stats(conn)
     trials = sum(n for n, _ in families.values()) + int(db.get_runtime_state(conn, "training_screened_trials", "0"))
     for agent in agents:
@@ -30,20 +44,27 @@ def export_snapshot(conn, cfg, path):
     temp = target.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     temp.replace(target)
+    print("CANDIDATE_EXPORT " + json.dumps({"exported": len(agents), "invalid_candidates_excluded": excluded}), flush=True)
     return len(agents)
 
 
 def import_snapshot(conn, cfg, path):
     """Validate everything before mutation. Failure prevents new entries, not exits."""
+    failure = "snapshot_unreadable"
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         created = datetime.fromisoformat(payload["created_at"])
         age = (datetime.now(timezone.utc) - created).total_seconds()
-        if (not 0 <= age <= cfg.get("runner", {}).get("candidate_max_age_hours", 24) * 3600
-                or payload["model_version"] != MODEL_VERSION
-                or payload["source_hash"] != db._source_hash()
-                or payload["policy_hash"] != policy_hash(cfg)):
-            raise ValueError("stale or incompatible candidates")
+        for valid, reason in (
+            (0 <= age <= cfg.get("runner", {}).get("candidate_max_age_hours", 24) * 3600, "snapshot_expired"),
+            (payload["model_version"] == MODEL_VERSION, "snapshot_model_mismatch"),
+            (payload["source_hash"] == db._source_hash(), "snapshot_source_mismatch"),
+            (payload["policy_hash"] == policy_hash(cfg), "snapshot_policy_mismatch"),
+        ):
+            if not valid:
+                failure = reason
+                raise ValueError(reason)
+        failure = "invalid_candidate_payload"
         agents = payload["agents"]
         if not isinstance(agents, list) or len(agents) > 200:
             raise ValueError("invalid candidate count")
@@ -57,6 +78,7 @@ def import_snapshot(conn, cfg, path):
                 raise ValueError("missing selection reference")
     except (OSError, KeyError, TypeError, ValueError):
         db.set_runtime_state(conn, "candidate_snapshot_ok", "0")
+        db.set_runtime_state(conn, "candidate_snapshot_failure", failure)
         return False
     # Promotions are decisions of the strict research supervisor; no direct cash operations.
     conn.execute("BEGIN IMMEDIATE")
@@ -82,6 +104,7 @@ def import_snapshot(conn, cfg, path):
             conn.execute("UPDATE agents SET " + ",".join(name + "=?" for name in fields) + ",status=? WHERE id=?",
                          [a.get(name) for name in fields] + [status, aid])
         db.set_runtime_state(conn, "candidate_snapshot_ok", "1", commit=False)
+        db.set_runtime_state(conn, "candidate_snapshot_failure", "", commit=False)
         db.set_runtime_state(conn, "candidate_snapshot_at", payload["created_at"], commit=False)
         conn.commit()
     except BaseException:

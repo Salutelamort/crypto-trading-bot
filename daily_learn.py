@@ -149,7 +149,8 @@ def _learn(conn, cfg, args, report):
         report.counters["cycles"] = cycles
         report.counters["cache_retained_bytes"] = cache.bytes
         report.counters["cache_retained_results"] = len(cache.values)
-        report.counters.update(indicator_cache.statistics())
+        for key, value in indicator_cache.statistics().items():
+            report.counters[key] = value
         report.save()
         if time.time() >= deadline:
             break

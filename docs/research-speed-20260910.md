@@ -50,3 +50,19 @@ The implemented screen uses the existing deterministic eligibility condition,
 not Optuna's relative-performance pruning.
 
 Offsite backup work is paused at the user's request. No new storage is provisioned.
+
+## First server observation
+
+The first completed run after deployment evaluated 7,239 candidates in 243.88s
+(29.68 evaluations/s), with 1,173 additional training-screen rejections. Previous
+ten-run throughput was approximately 19.5 evaluations/s. This is one observational
+comparison with a different random population, not a controlled speed guarantee.
+Candidate persistence took 2.46s and selection persistence 1.05s.
+
+The first indicator-cache report accidentally added successive counter snapshots;
+the follow-up assigns the current values, so retained bytes and hit counts are no
+longer accumulated repeatedly. That reporting error did not change the cache limit.
+
+Candidate exchange now excludes invalid legacy genomes on export and records an
+explicit reason for rejected imports. The receiver still rejects an invalid
+snapshot atomically; no admission checks are bypassed.
