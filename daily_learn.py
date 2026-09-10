@@ -26,6 +26,7 @@ from src import (
     db,
     evolution,
     execution_report,
+    indicator_cache,
     live_trade,
     macro_feed,
     news_feed,
@@ -109,7 +110,8 @@ def main():
     report = research_report.ResearchReport(Path(args.candidate_path).parent)
     report.save()
     try:
-        _learn(conn, cfg, args, report)
+        with indicator_cache.research_cache():
+            _learn(conn, cfg, args, report)
     except BaseException:
         report.save("failed")
         raise
@@ -147,6 +149,7 @@ def _learn(conn, cfg, args, report):
         report.counters["cycles"] = cycles
         report.counters["cache_retained_bytes"] = cache.bytes
         report.counters["cache_retained_results"] = len(cache.values)
+        report.counters.update(indicator_cache.statistics())
         report.save()
         if time.time() >= deadline:
             break

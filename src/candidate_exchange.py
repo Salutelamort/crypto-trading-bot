@@ -18,7 +18,7 @@ def export_snapshot(conn, cfg, path):
     agents = [a for a in db.get_agents(conn) if a["status"] in ("promoted", "candidate")
               and a.get("model_version") == MODEL_VERSION]
     families = db.trial_family_stats(conn)
-    trials = sum(n for n, _ in families.values())
+    trials = sum(n for n, _ in families.values()) + int(db.get_runtime_state(conn, "training_screened_trials", "0"))
     for agent in agents:
         family = (json.loads(agent["genome"])["type"], agent["symbol"], agent["timeframe"])
         _, sigma = families.get(family, (0, 0))

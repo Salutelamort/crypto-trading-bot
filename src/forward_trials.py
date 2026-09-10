@@ -8,6 +8,46 @@ from . import db, live_trade, readiness, strategy_audit
 from .execution_core import MODEL_VERSION
 
 
+def admission_reasons(agent, cfg):
+    reasons = []
+    if agent["status"] not in ("candidate", "promoted"):
+        reasons.append("inactive_candidate")
+    if agent.get("model_version") != MODEL_VERSION:
+        reasons.append("incompatible_model")
+    if (agent.get("test_return") or 0) <= 0:
+        reasons.append("nonpositive_validation_return")
+    if (agent.get("test_pf") or 0) < 1.1:
+        reasons.append("profit_factor_below_1.1")
+    if (agent.get("test_trades") or 0) < 20:
+        reasons.append("fewer_than_20_validation_trades")
+    if cfg.get("supervisor", {}).get("require_signal_audit", False) and not strategy_audit.passed(agent.get("signal_audit")):
+        reasons.append("signal_or_parameter_audit_not_passed")
+    return reasons
+
+
+def diagnostics(conn, cfg):
+    candidates = [a for a in db.get_agents(conn) if a["status"] in ("candidate", "promoted")]
+    active = conn.execute("SELECT COUNT(*) FROM forward_trials WHERE status='active'").fetchone()[0]
+    experiment = db.get_runtime_state(conn, "current_experiment")
+    observations = []
+    for agent in candidates:
+        decisions = conn.execute("SELECT bar_at,payload FROM replay_decisions WHERE run_id=? ORDER BY bar_at DESC LIMIT 1000",
+                                 (f"{experiment}:{agent['id']}",)).fetchall()
+        signals = [(r["bar_at"], json.loads(r["payload"])) for r in decisions]
+        nonzero = next((stamp for stamp, value in signals if any(s != 0 for s in value["signals"])), None)
+        observations.append({"agent_id": agent["id"], "symbol": agent["symbol"], "timeframe": agent["timeframe"],
+            "status": agent["status"], "admission_reasons": admission_reasons(agent, cfg),
+            "test_trades": agent.get("test_trades"), "test_return": agent.get("test_return"),
+            "test_pf": agent.get("test_pf"), "last_observed_bar": signals[0][0] if signals else None,
+            "last_observed_signals": signals[0][1]["signals"] if signals else [],
+            "last_nonzero_signal_in_recorded_window": nonzero,
+            "signal_observation_status": "recorded" if signals else "not_observed",
+            "signal_history_limit_bars": 1000})
+    return {"updated_at": db.now_iso(), "enabled": cfg.get("forward", {}).get("enabled", False),
+            "active_trials": active, "capacity": cfg.get("forward", {}).get("max_active_trials", 4),
+            "candidate_count": len(candidates), "candidates": observations}
+
+
 def enroll(conn, cfg):
     policy = cfg.get("forward", {})
     if not policy.get("enabled", False):
@@ -23,13 +63,9 @@ def enroll(conn, cfg):
         if count >= policy.get("max_active_trials", 4):
             break
         # Admission to an isolated observation account is not admission to portfolio/live money.
-        if (agent["status"] not in ("candidate", "promoted") or agent.get("model_version") != MODEL_VERSION
-                or (agent.get("test_return") or 0) <= 0 or (agent.get("test_pf") or 0) < 1.1
-                or (agent.get("test_trades") or 0) < 20):
+        if admission_reasons(agent, cfg):
             continue
         genome = json.loads(agent["genome"])
-        if cfg.get("supervisor", {}).get("require_signal_audit", False) and not strategy_audit.passed(agent.get("signal_audit")):
-            continue
         frozen_cfg = copy.deepcopy(cfg)
         frozen_cfg["forward"] = {"enabled": False}
         frozen_cfg["reconciliation"] = {"enabled": False}

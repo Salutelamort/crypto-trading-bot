@@ -42,6 +42,10 @@ class ResearchReport:
         if test.get("stress_return") is not None and test["stress_return"] <= 0:
             self.reasons["cost_stress_failed"] += 1
 
+    def screened(self, genome):
+        self.seen.add(hashlib.sha256(json.dumps(genome, sort_keys=True).encode()).hexdigest())
+        self.counters["training_screen_rejections"] += 1
+
     def save(self, status="running"):
         elapsed = time.monotonic() - self.started
         stages = {**self.seconds, "other": max(0, elapsed - sum(self.seconds.values()))}

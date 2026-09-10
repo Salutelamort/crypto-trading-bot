@@ -7,6 +7,8 @@
 import numpy as np
 import pandas as pd
 
+from .indicator_cache import cached
+
 
 def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).mean()
@@ -16,6 +18,7 @@ def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+@cached
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
@@ -58,6 +61,7 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     return macd_line, signal_line
 
 
+@cached
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     ADX — СИЛА тренда (не направление). Высокий ADX = выраженный тренд,
@@ -76,6 +80,7 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.rolling(period).mean()
 
 
+@cached
 def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.Series:
     """
     Supertrend — ATR-трендследование. Возвращает направление тренда: +1 (вверх) / -1 (вниз).

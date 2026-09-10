@@ -9,13 +9,32 @@ export function verify(value, now = Date.now()) {
     && value.heartbeat_age_seconds >= 0 && value.heartbeat_age_seconds <= 180;
 }
 
-export async function observe(env, fetcher = fetch, now = Date.now()) {
+export async function observe(env, fetcher = (...args) => globalThis.fetch(...args), now = Date.now()) {
   let ok = false;
+  let reason = 'http_error'; let httpStatus = null;
   try {
-    const response = await fetcher(env.BOT_MONITOR_URL, {
-      headers: { 'Cache-Control': 'no-cache' }, redirect: 'error',
-      signal: AbortSignal.timeout(15000),
-    });
+    const url = new URL(env.BOT_MONITOR_URL);
+    url.searchParams.set('observation', String(now));
+    let target = url;
+    let response;
+    const signal = AbortSignal.timeout(15000);
+    for (let hop = 0; hop <= 3; hop++) {
+      response = await fetcher(target.toString(), {
+        headers: { 'Cache-Control': 'no-cache' }, redirect: 'manual', signal,
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get('Location');
+      const next = location ? new URL(location, target) : null;
+      await env.STATE.put('redirect_diagnostic', JSON.stringify({ status: response.status,
+        hostname: next?.hostname, pathname: next?.pathname }));
+      if (!next || next.protocol !== 'https:' || next.origin !== url.origin || hop === 3) {
+        throw new Error('redirect rejected');
+      }
+      await response.body?.cancel();
+      target = next;
+    }
+    httpStatus = response.status;
     if (response.status === 200) {
       const reader = response.body.getReader();
       const chunks = []; let size = 0;
@@ -29,8 +48,16 @@ export async function observe(env, fetcher = fetch, now = Date.now()) {
       const bytes = new Uint8Array(size); let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
       ok = verify(JSON.parse(new TextDecoder().decode(bytes)), now);
+      reason = ok ? 'healthy' : 'invalid_or_unhealthy_evidence';
     }
-  } catch { /* Store failure without response bodies, URLs or credentials. */ }
+  } catch (error) {
+    reason = ['TimeoutError', 'AbortError', 'SyntaxError', 'TypeError'].includes(error?.name)
+      ? error.name : 'request_failed';
+    if (/illegal invocation|incorrect this/i.test(error?.message ?? '')) reason = 'invalid_fetch_binding';
+    if (/redirect/i.test(error?.message ?? '')) reason = 'redirect_rejected';
+    await env.STATE.put('request_diagnostic', JSON.stringify({ at: new Date(now).toISOString(),
+      reason, detail: String(error?.message ?? '').replace(/https?:\/\/\S+/g, '[url]').slice(0, 200) }));
+  }
   const previous = await env.STATE.get('latest', 'json');
   const failures = ok ? 0 : (previous?.failures ?? 0) + 1;
   let alertedAt = previous?.alerted_at ?? 0;
@@ -50,7 +77,7 @@ export async function observe(env, fetcher = fetch, now = Date.now()) {
     } catch { notification = 'failed'; }
   }
   const value = { schema_version: 1, ok, checked_at: new Date(now).toISOString(), failures,
-    alerted_at: alertedAt, notification };
+    alerted_at: alertedAt, notification, reason, http_status: httpStatus };
   await env.STATE.put('latest', JSON.stringify(value));
   return value;
 }

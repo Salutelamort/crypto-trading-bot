@@ -6,9 +6,10 @@ const now = Date.now();
 const healthy = { schema_version: 1, ok: true, checked_at: new Date(now).toISOString(), heartbeat_age_seconds: 1,
   checks: Object.fromEntries(['process', 'paper_mode', 'heartbeat', 'market_data', 'ledger', 'research', 'backup'].map(k => [k, true])) };
 function environment() {
-  let value = null;
+  const values = new Map();
   return { BOT_MONITOR_URL: 'https://example.test/monitor', STATE: {
-    async get() { return value; }, async put(_key, text) { value = JSON.parse(text); },
+    async get(key = 'latest') { return values.get(key) ?? null; },
+    async put(key, text) { values.set(key, JSON.parse(text)); },
   } };
 }
 test('rejects stale and incomplete operational evidence', () => {
@@ -57,4 +58,16 @@ test('oversized response is rejected and stale stored success returns 503', asyn
   assert.equal(result.ok, false);
   await env.STATE.put('latest', JSON.stringify({ ok: true, checked_at: new Date(now - 900000).toISOString() }));
   assert.equal((await worker.fetch(new Request('https://example.test/status'), env)).status, 503);
+});
+test('follows same-origin HTTPS redirects but rejects foreign destinations', async () => {
+  const env = environment(); let calls = 0;
+  const fetcher = async () => ++calls === 1
+    ? new Response(null, { status: 302, headers: { Location: '/fresh-monitor' } })
+    : Response.json(healthy);
+  assert.equal((await observe(env, fetcher, now)).ok, true);
+  assert.equal(calls, 2);
+  const rejected = await observe(env, async () => new Response(null,
+    { status: 302, headers: { Location: 'https://unrelated.test' } }), now);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, 'redirect_rejected');
 });

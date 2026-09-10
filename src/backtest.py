@@ -165,7 +165,11 @@ def split_train_test(df: pd.DataFrame, train_ratio: float):
     return df.iloc[:cut], df.iloc[cut:]
 
 
-def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict, *, record_trades=True):
+class TrainingRejected(ValueError):
+    """Candidate fails the existing minimum training-trade requirement."""
+
+
+def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict, *, record_trades=True, min_train_trades=0):
     """
     WALK-FORWARD валидация (совет из треда против переобучения).
 
@@ -180,9 +184,15 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict, *, record_trade
     import numpy as np
     delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
     allow_short = cfg["risk"].get("allow_short", False)
-    full_sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int)
-
     cut = int(len(df) * cfg["train_ratio"])
+    screened_train = None
+    if min_train_trades > 0:
+        training = df.iloc[:cut]
+        training_signal = gn.signal(genome, training, allow_short).shift(delay).fillna(0).astype(int)
+        screened_train = run(genome, training, cfg, sig=training_signal, record_trades=record_trades)
+        if screened_train["num_trades"] < min_train_trades:
+            raise TrainingRejected("insufficient_training_trades")
+    full_sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int)
     # EMBARGO (López de Prado, purged CV): зазор между train и test, чтобы индикаторы
     # на границе не "подсматривали" данные обучения (утечка). Пропускаем N баров.
     embargo = int(cfg.get("validation", {}).get("embargo_bars", 0))
@@ -190,7 +200,8 @@ def walk_forward_eval(genome: dict, df: pd.DataFrame, cfg: dict, *, record_trade
     train_df = df.iloc[:cut]
     oos_df = df.iloc[oos_start:]
 
-    train_m = run(genome, train_df, cfg, sig=full_sig.iloc[:cut], record_trades=record_trades)
+    train_m = screened_train if screened_train is not None else run(
+        genome, train_df, cfg, sig=full_sig.iloc[:cut], record_trades=record_trades)
 
     nwin = cfg.get("validation", {}).get("walk_forward_windows", 4)
     idx = list(range(len(oos_df)))

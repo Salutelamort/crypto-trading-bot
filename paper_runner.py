@@ -70,6 +70,16 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
     forward_trials.enroll(conn, cfg)
     forward_trials.tick_all(conn, book_provider)
     write_summary(conn, cfg, state_path)
+    diagnostic_path = Path(state_path).parent / "forward-diagnostics.json"
+    if not diagnostic_path.exists() or time.time() - diagnostic_path.stat().st_mtime >= 300:
+        try:
+            diagnostic = forward_trials.diagnostics(conn, cfg)
+            temporary = diagnostic_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(diagnostic, allow_nan=False), encoding="utf-8")
+            temporary.replace(diagnostic_path)
+            print("FORWARD_DIAGNOSTICS " + json.dumps(diagnostic, allow_nan=False), flush=True)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"Forward diagnostics failed: {type(error).__name__}; retry next cycle", flush=True)
     if cfg.get("reconciliation", {}).get("enabled", False):
         target = Path(state_path).parent / "reconciliation.json"
         if not target.exists() or time.time() - target.stat().st_mtime >= cfg["reconciliation"].get("report_interval_seconds", 300):

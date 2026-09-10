@@ -313,18 +313,19 @@ def current_provenance(conn):
 
 
 # ---------- агенты ----------
-def insert_agent(conn, genome: dict, symbol: str, timeframe: str) -> int:
+def insert_agent(conn, genome: dict, symbol: str, timeframe: str, *, commit=True) -> int:
     cur = conn.execute(
         "INSERT INTO agents (genome, symbol, timeframe, status, born_at) "
         "VALUES (?,?,?,?,?)",
         (json.dumps(genome), symbol, timeframe, "candidate", now_iso()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
 def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consistency: float,
-                         count_trial: bool = True):
+                         count_trial: bool = True, *, commit=True):
     conn.execute(
         """UPDATE agents SET
             train_sharpe=?, train_return=?, train_winrate=?, train_trades=?,
@@ -353,10 +354,11 @@ def update_agent_metrics(conn, agent_id: int, train: dict, test: dict, consisten
             stype = "?"
         record_trial(conn, stype, row["symbol"], row["timeframe"],
                      test.get("sharpe"), test.get("alpha", 0.0))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def set_agent_status(conn, agent_id: int, status: str):
+def set_agent_status(conn, agent_id: int, status: str, *, commit=True):
     killed_at = now_iso() if status == "killed" else None
     conn.execute("UPDATE agents SET status=?, killed_at=? WHERE id=?",
                  (status, killed_at, agent_id))
@@ -372,7 +374,8 @@ def set_agent_status(conn, agent_id: int, status: str):
                 "UPDATE agent_stats SET n_promoted=n_promoted+1 "
                 "WHERE type=? AND symbol=? AND timeframe=?",
                 (stype, r["symbol"], r["timeframe"]))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ---------- компактная память об испытаниях (agent_stats) ----------
@@ -509,12 +512,21 @@ def get_agents(conn, status: str | None = None):
 
 
 # ---------- решения ----------
-def log_decision(conn, agent_id, action: str, backend: str, rationale: str):
+def log_decision(conn, agent_id, action: str, backend: str, rationale: str, *, commit=True):
     conn.execute(
         "INSERT INTO decisions (ts, agent_id, action, backend, rationale) VALUES (?,?,?,?,?)",
         (now_iso(), agent_id, action, backend, rationale),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def kill_research_batch(conn, decisions):
+    """Atomically record research rejections; never used by the paper ledger."""
+    with conn:
+        for agent_id, rationale in decisions:
+            set_agent_status(conn, agent_id, "killed", commit=False)
+            log_decision(conn, agent_id, "kill", "rules", rationale, commit=False)
 
 
 # ---------- карантин ----------

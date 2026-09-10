@@ -46,9 +46,10 @@ def _fitness(agent, min_trades):
     return agent["train_sharpe"] if agent["train_sharpe"] is not None else -99.0
 
 
-def _evaluate(genome, df, cfg):
+def _evaluate(genome, df, cfg, *, screen_training=False):
     """Walk-forward оценка агента. consistency = доля прибыльных OOS окон."""
-    train, test, consistency = bt.walk_forward_eval(genome, df, cfg, record_trades=False)
+    options = {"min_train_trades": cfg["evolution"].get("min_trades", 0)} if screen_training else {}
+    train, test, consistency = bt.walk_forward_eval(genome, df, cfg, record_trades=False, **options)
     factors = cfg.get("validation", {}).get("cost_stress_multipliers", [])
     plausible = test["total_return"] > 0 and test["num_trades"] >= cfg["supervisor"].get("promote_min_trades", 20)
     audit_ok = True
@@ -74,6 +75,10 @@ def _evaluate(genome, df, cfg):
         test["stress_return"] = min(item["total_return"] for item in stressed_results)
         test["stress_pf"] = min(item["profit_factor"] for item in stressed_results)
     return train, test, consistency
+
+
+def _evaluate_candidate(genome, df, cfg):
+    return _evaluate(genome, df, cfg, screen_training=True)
 
 
 def reevaluate_promoted(conn, cfg, data_by_key, cache=None):
@@ -185,6 +190,7 @@ def _anti_clone(conn, cfg, data_by_key):
     # Series were aligned to complete UTC days, including different timeframes.
     order = sorted(info.keys(), key=lambda i: score[i], reverse=True)
     kept, killed = [], 0
+    rejections = []
     for i in order:
         r_i = info[i]
         clone = False
@@ -201,13 +207,13 @@ def _anti_clone(conn, cfg, data_by_key):
                 clone = True
                 break
         if clone:
-            db.set_agent_status(conn, i, "killed")
-            db.log_decision(conn, i, "kill", "rules",
-                            "анти-клон: совпадение доходностей или убыточных дней с более сильным агентом "
-                            "(нет диверсификации)")
+            rejections.append((i,
+                            ("анти-клон: совпадение доходностей или убыточных дней с более сильным агентом "
+                             "(нет диверсификации)")))
             killed += 1
         else:
             kept.append(i)
+    db.kill_research_batch(conn, rejections)
     return killed
 
 
@@ -256,6 +262,22 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
         new_genomes = new_genomes[:max(need, 0)]
 
         # 2. Оцениваем новых кандидатов через walk-forward.
+        evaluated = []
+        screened = [0]
+
+        def persist_candidates(evaluated=evaluated, screened=screened):
+            with (report.stage("candidate_persistence") if report else nullcontext()), conn:
+                for candidate, train, test, consistency in evaluated:
+                    aid = db.insert_agent(conn, candidate, candidate["symbol"], candidate["timeframe"], commit=False)
+                    db.update_agent_metrics(conn, aid, train, test, consistency, commit=False)
+                if screened[0]:
+                    previous = int(db.get_runtime_state(conn, "training_screened_trials", "0"))
+                    db.set_runtime_state(conn, "training_screened_trials", str(previous + screened[0]), commit=False)
+            if report:
+                report.counters["candidate_write_transactions"] += bool(evaluated)
+            evaluated.clear()
+            screened[0] = 0
+
         for g in new_genomes:
             key = (g["symbol"], g["timeframe"])
             if key not in data_by_key:
@@ -268,28 +290,38 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
                     report.counters["insufficient_history"] += 1
                 continue
             hits = cache.hits
-            with report.stage("candidate_evaluation") if report else nullcontext():
-                train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate)
+            try:
+                with report.stage("candidate_evaluation") if report else nullcontext():
+                    train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate_candidate)
+            except bt.TrainingRejected:
+                screened[0] += 1
+                if report:
+                    report.screened(g)
+                continue
             if report:
                 report.evaluation(g, train_m, test_m, cache.hits > hits)
-            aid = db.insert_agent(conn, g, g["symbol"], g["timeframe"])
-            db.update_agent_metrics(conn, aid, train_m, test_m, cons)
+            evaluated.append((g, train_m, test_m, cons))
+            if len(evaluated) >= 32:
+                persist_candidates()
+        persist_candidates()
 
         # 3. Отбор: выживают лучшие С КВОТОЙ на символ (диверсификация генофонда).
         alive = db.get_agents(conn, "candidate")
         ranked = sorted(alive, key=lambda a: _fitness(a, min_tr), reverse=True)
         keep_ids = {a["id"] for a in _select_survivors(ranked, ev["survivors"], max_per_sym)}
+        rejections = []
         for a in ranked:
             if a["id"] in keep_ids:
                 continue
-            db.set_agent_status(conn, a["id"], "killed")
             if report:
                 report.counters["evolution_rejections"] += 1
             reason = (f"мало сделок ({a['train_trades']} < {min_tr})"
                       if (a["train_trades"] or 0) < min_tr
                       else f"train_sharpe {a['train_sharpe']} вне топ-{ev['survivors']} (с квотой на символ)")
-            db.log_decision(conn, a["id"], "kill", "rules",
-                            f"эволюционный отбор: {reason}")
+            rejections.append((a["id"],
+                            f"эволюционный отбор: {reason}"))
+        with report.stage("selection_persistence") if report else nullcontext():
+            db.kill_research_batch(conn, rejections)
 
         # 4. Анти-клон фильтр (по реальной корреляции дохода → диверсификация).
         with report.stage("correlation_filter") if report else nullcontext():

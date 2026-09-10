@@ -196,7 +196,7 @@ def supervise(conn, cfg):
         # Коррелированные поиски разных типов/рынков нельзя считать миллионами
         # независимых ставок. Считаем SR0 отдельно в каждой семье.
         family_stats = db.trial_family_stats(conn)
-        total_trials = sum(n for n, _ in family_stats.values())
+        total_trials = sum(n for n, _ in family_stats.values()) + int(db.get_runtime_state(conn, "training_screened_trials", "0"))
         sr0 = {family: mt.expected_max_sharpe_from_stats(max(n, total_trials), sigma)
                for family, (n, sigma) in family_stats.items()}
         bars = list(sr0.values())
