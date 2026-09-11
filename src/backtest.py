@@ -55,6 +55,14 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     n = len(df)
     atr_arr = ind.atr(df, risk.get("atr_period", 14)).values if risk.get("atr_stop") else [None] * n
 
+    if not record_trades and not record_orders and trade_start is None and cfg.get("evolution", {}).get("compiled_backtest", False):
+        from . import backtest_kernel
+        if backtest_kernel.eligible(opened, close, high, low, sig_arr, fee, slip):
+            equity_curve, period_returns, trade_results = backtest_kernel.run_arrays(
+                opened, close, high, low, sig_arr, atr_arr, risk, fee, slip, cooldown)
+            return _metrics(genome, df, close, equity_curve, period_returns,
+                            trade_results.tolist(), [], False, [], False)
+
     cash = 1.0
     in_pos = False
     direction = 0
@@ -144,6 +152,13 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
         period_returns.append(equity / prev_equity - 1 if prev_equity else 0.0)
         prev_equity = equity
 
+    return _metrics(genome, df, close, equity_curve, period_returns, trade_results,
+                    trade_log, record_trades, order_log, record_orders)
+
+
+def _metrics(genome, df, close, equity_curve, period_returns, trade_results,
+             trade_log, record_trades, order_log, record_orders):
+    n = len(df)
     eq = pd.Series(equity_curve, index=df.index)
     rets = pd.Series(period_returns, index=df.index)
     buy_hold = float(close[-1] / close[0] - 1) if n else 0.0

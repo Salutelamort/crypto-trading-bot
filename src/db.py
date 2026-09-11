@@ -285,10 +285,11 @@ def _source_hash():
 
 def ensure_experiment(conn, cfg, *, commit=True):
     """Регистрирует текущую forward-когорту без сброса счёта или старых сделок."""
-    raw = json.dumps(cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    from .versioning import trading_config, trading_hash
+    raw = json.dumps(trading_config(cfg), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     config_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     code_sha = _code_sha()
-    source_hash = _source_hash()
+    source_hash = trading_hash()
     requested = cfg.get("experiment", {}).get("id", "paper-forward")
     experiment_id = f"{requested}:{config_hash}:{source_hash}"
     conn.execute(

@@ -6,6 +6,7 @@ from contextlib import closing
 
 from . import db, live_trade, readiness, strategy_audit
 from .execution_core import MODEL_VERSION
+from .versioning import trading_config, trading_hash
 
 
 def admission_reasons(agent, cfg):
@@ -56,7 +57,7 @@ def enroll(conn, cfg):
     policy = cfg.get("forward", {})
     if not policy.get("enabled", False):
         return 0
-    source = db._source_hash()
+    source = trading_hash()
     # A changed implementation invalidates continuation of a frozen code experiment.
     conn.execute("UPDATE forward_trials SET status='version_changed' WHERE status='active' AND source_hash<>?", (source,))
     conn.commit()
@@ -77,7 +78,7 @@ def enroll(conn, cfg):
         frozen_cfg["risk"]["max_open_positions"] = 1
         frozen_cfg["live"]["allow_unpromoted"] = False
         frozen_cfg.setdefault("runner", {})["require_candidate_snapshot"] = False
-        identity = json.dumps({"genome": genome, "config": frozen_cfg, "source": source}, sort_keys=True)
+        identity = json.dumps({"genome": genome, "config": trading_config(frozen_cfg), "source": source}, sort_keys=True)
         trial_id = hashlib.sha256(identity.encode()).hexdigest()[:20]
         if conn.execute("SELECT 1 FROM forward_trials WHERE id=?", (trial_id,)).fetchone():
             continue
@@ -98,7 +99,7 @@ def enroll(conn, cfg):
 
 
 def tick_all(conn, book_provider=None):
-    source = db._source_hash()
+    source = trading_hash()
     for row in conn.execute("SELECT * FROM forward_trials WHERE status='active'").fetchall():
         if row["source_hash"] != source:
             conn.execute("UPDATE forward_trials SET status='version_changed' WHERE id=?", (row["id"],))

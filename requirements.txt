@@ -3,6 +3,7 @@ requests==2.34.2
 websocket-client==1.9.2
 pandas==2.2.3
 numpy==2.3.5
+numba==0.63.1
 PyYAML==6.0.3
 
 # Для макро-фильтра (парсинг таблиц потоков в ETF с farside.co.uk)

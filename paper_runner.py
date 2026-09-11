@@ -14,6 +14,7 @@ from src import (
     execution_report,
     forward_trials,
     live_trade,
+    market_cycle,
     market_data,
     replay_report,
 )
@@ -66,9 +67,10 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
     runner_cfg = cfg.get("runner", {})
     if runner_cfg.get("require_candidate_snapshot", False):
         candidate_exchange.import_snapshot(conn, cfg, runner_cfg.get("candidate_path", "state/candidates.json"))
-    report = live_trade.tick(conn, cfg, book_provider=book_provider)
-    forward_trials.enroll(conn, cfg)
-    forward_trials.tick_all(conn, book_provider)
+    with market_cycle.shared_observations():
+        report = live_trade.tick(conn, cfg, book_provider=book_provider)
+        forward_trials.enroll(conn, cfg)
+        forward_trials.tick_all(conn, book_provider)
     write_summary(conn, cfg, state_path)
     diagnostic_path = Path(state_path).parent / "forward-diagnostics.json"
     if not diagnostic_path.exists() or time.time() - diagnostic_path.stat().st_mtime >= 300:

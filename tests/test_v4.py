@@ -81,7 +81,7 @@ class V4Tests(unittest.TestCase):
             conn.execute("UPDATE agents SET model_version=?,test_return=.1,test_pf=2,test_trades=100 WHERE id=?",
                          (MODEL_VERSION, aid))
             conn.commit()
-            with mock.patch.object(db, "_source_hash", return_value="one"):
+            with mock.patch.object(forward_trials, "trading_hash", return_value="one"):
                 self.assertEqual(forward_trials.enroll(conn, cfg), 1)
                 self.assertEqual(forward_trials.enroll(conn, cfg), 0)
                 reports = forward_trials.reports(conn)
@@ -90,7 +90,7 @@ class V4Tests(unittest.TestCase):
             before = conn.execute("SELECT ledger FROM forward_trials").fetchone()[0]
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM live_account").fetchone()[0], 0)
             cfg["forward"]["max_active_trials"] = 0
-            with mock.patch.object(db, "_source_hash", return_value="two"):
+            with mock.patch.object(forward_trials, "trading_hash", return_value="two"):
                 forward_trials.enroll(conn, cfg)
             row = conn.execute("SELECT * FROM forward_trials").fetchone()
             self.assertEqual(row["status"], "version_changed")

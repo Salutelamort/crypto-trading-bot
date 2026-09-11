@@ -143,12 +143,15 @@ def _learn(conn, cfg, args, report):
     cycles = 0
     cache = EvaluationCache(cfg["evolution"].get("evaluation_cache_size", 64),
                             cfg["evolution"].get("evaluation_cache_mb", 32) * 1024 * 1024)
+    returns_cache = EvaluationCache(2048, 8 * 1024 * 1024)
     while True:
-        evolution.evolve(conn, cfg, data, report=report, cache=cache)
+        evolution.evolve(conn, cfg, data, report=report, cache=cache, returns_cache=returns_cache)
         cycles += 1
         report.counters["cycles"] = cycles
         report.counters["cache_retained_bytes"] = cache.bytes
         report.counters["cache_retained_results"] = len(cache.values)
+        report.counters["correlation_cache_hits"] = returns_cache.hits
+        report.counters["correlation_cache_bytes"] = returns_cache.bytes
         for key, value in indicator_cache.statistics().items():
             report.counters[key] = value
         report.save()

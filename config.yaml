@@ -50,6 +50,8 @@ validation:
 
 # --- Эволюция (генерация/отбор/убийство агентов) ---
 evolution:
+  compiled_backtest: true
+  guided_archive_size: 512
   evaluation_cache_size: 512
   evaluation_cache_mb: 32 # shared across cycles; bounded to avoid starving the paper process
   anti_clone_loss_corr: 0.85

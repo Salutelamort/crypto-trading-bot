@@ -26,6 +26,7 @@ from . import backtest as bt
 from . import db, strategy_audit
 from . import genome as gn
 from .evaluation_cache import EvaluationCache
+from .guided_search import GuidedSearch
 
 
 def _fitness(agent, min_trades):
@@ -144,7 +145,7 @@ def _oos_returns(genome, df, cfg):
     delay = cfg.get("execution", {}).get("signal_delay_bars", 1)
     allow_short = cfg["risk"].get("allow_short", False)
     sig = gn.signal(genome, df, allow_short).shift(delay).fillna(0).astype(int).iloc[cut:]
-    m = bt.run(genome, oos, cfg, sig=sig)
+    m = bt.run(genome, oos, cfg, sig=sig, record_trades=False)
     return m["returns"]
 
 
@@ -157,7 +158,7 @@ def common_daily_returns(returns):
     return days.iloc[1:-1].dropna()
 
 
-def _anti_clone(conn, cfg, data_by_key):
+def _anti_clone(conn, cfg, data_by_key, returns_cache=None):
     """
     ДИВЕРСИФИКАЦИЯ. Убиваем клонов по РЕАЛЬНОЙ корреляции кривых дохода
     (а не по близости Sharpe, как раньше — то пропускало однотипных).
@@ -176,8 +177,11 @@ def _anti_clone(conn, cfg, data_by_key):
         if key not in data_by_key:
             continue
         try:
-            info[a["id"]] = common_daily_returns(
-                _oos_returns(json.loads(a["genome"]), data_by_key[key], cfg))
+            genome = json.loads(a["genome"])
+            def calculate(g, frame, config):
+                return common_daily_returns(_oos_returns(g, frame, config))
+            info[a["id"]] = (returns_cache.evaluate(genome, data_by_key[key], cfg, calculate)
+                             if returns_cache is not None else calculate(genome, data_by_key[key], cfg))
         except Exception:  # noqa
             continue
     if len(info) < 2:
@@ -217,7 +221,7 @@ def _anti_clone(conn, cfg, data_by_key):
     return killed
 
 
-def evolve(conn, cfg, data_by_key, report=None, cache=None):
+def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
     """
     data_by_key: {(symbol, timeframe): DataFrame OHLCV}
     МУЛЬТИТАЙМФРЕЙМ: таймфрейм — часть генома, эволюция ищет лучший под стратегию.
@@ -230,7 +234,10 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
     ev = cfg["evolution"]
     if cache is None:
         cache = EvaluationCache(ev.get("evaluation_cache_size", 64), ev.get("evaluation_cache_mb", 32) * 1024 * 1024)
+    if returns_cache is None:
+        returns_cache = EvaluationCache(2048, 8 * 1024 * 1024)
     rng = random.Random(ev.get("seed"))
+    search = GuidedSearch(conn, ev.get("guided_archive_size", 512))
     quarantined = db.quarantined_symbols(conn)
     # доступные пары (символ, таймфрейм): есть данные и символ не в карантине
     keys = [(s, tf) for (s, tf) in data_by_key
@@ -251,14 +258,26 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
         survivors = _select_survivors(ranked_alive, ev["survivors"], max_per_sym)
 
         new_genomes = []
+        mutation_limit = max(0, int(max(need, 0) * 0.5))
         # мутации выживших (символ И таймфрейм сохраняются)
         for s in survivors:
             for _ in range(ev["mutations_per_survivor"]):
+                if len(new_genomes) >= mutation_limit:
+                    break
                 new_genomes.append(gn.mutate(json.loads(s["genome"]), rng))
+                if report:
+                    report.counters["proposals_survivor"] += 1
         # добиваем случайными по всем парам (символ × таймфрейм)
         while len(new_genomes) < need:
-            sym, tf = rng.choice(keys)
-            new_genomes.append(gn.random_genome(sym, tf, rng))
+            # At least a quarter of slots remain fresh random exploration.
+            if len(new_genomes) < int(max(need, 0) * 0.75):
+                proposal, origin = search.propose(keys, rng)
+            else:
+                sym, tf = rng.choice(keys)
+                proposal, origin = gn.random_genome(sym, tf, rng), "random"
+            new_genomes.append(proposal)
+            if report:
+                report.counters["proposals_" + origin] += 1
         new_genomes = new_genomes[:max(need, 0)]
 
         # 2. Оцениваем новых кандидатов через walk-forward.
@@ -300,10 +319,14 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
                 continue
             if report:
                 report.evaluation(g, train_m, test_m, cache.hits > hits)
+            if "returns" in test_m:
+                returns_cache.evaluate(g, df, cfg, lambda *_, metrics=test_m: common_daily_returns(metrics["returns"]))
+            search.record(g, train_m)
             evaluated.append((g, train_m, test_m, cons))
             if len(evaluated) >= 32:
                 persist_candidates()
         persist_candidates()
+        search.save()
 
         # 3. Отбор: выживают лучшие С КВОТОЙ на символ (диверсификация генофонда).
         alive = db.get_agents(conn, "candidate")
@@ -325,7 +348,7 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None):
 
         # 4. Анти-клон фильтр (по реальной корреляции дохода → диверсификация).
         with report.stage("correlation_filter") if report else nullcontext():
-            cloned = _anti_clone(conn, cfg, data_by_key)
+            cloned = _anti_clone(conn, cfg, data_by_key, returns_cache)
         if report:
             report.counters["correlated_rejections"] += cloned
 

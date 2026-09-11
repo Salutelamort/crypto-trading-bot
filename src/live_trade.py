@@ -24,6 +24,7 @@ from . import genome as gn
 from . import indicators as ind
 from . import risk as rk
 from .db import now_iso
+from .market_cycle import observe
 
 FEED_ERRORS = (requests.RequestException, OSError, RuntimeError, ValueError,
                KeyError, IndexError, TypeError, DecimalException)
@@ -173,7 +174,7 @@ def _replay_minutes(pos, bars, until, risk_cfg):
 
 def _collect_market(conn, cfg, book_provider=None):
     """Network calls run before the account transaction; missing/raced data blocks entries."""
-    at = _utc(now_iso())
+    at = _utc(observe(now_iso))
     agents, _ = _active_agents(conn, cfg)
     positions = _load_positions(conn)
     pairs = {(a["symbol"], a["timeframe"]) for a in agents}
@@ -184,7 +185,7 @@ def _collect_market(conn, cfg, book_provider=None):
     result = {"at": at, "frames": {}, "minutes": {}, "books": {}, "macro": {}, "news": {}, "rules": {}}
     for sym, tf in sorted(pairs):
         try:
-            result["frames"][(sym, tf)] = feed.fetch_recent(sym, tf, 400)
+            result["frames"][(sym, tf)] = observe(feed.fetch_recent, sym, tf, 400)
         except FEED_ERRORS:
             continue
     for sym in {p.symbol for p in positions.values()}:
@@ -193,7 +194,7 @@ def _collect_market(conn, cfg, book_provider=None):
         if min(starts) >= at.floor("min"):
             continue
         try:
-            result["minutes"][sym] = feed.fetch_since(
+            result["minutes"][sym] = observe(feed.fetch_since,
                 sym, "1m", int(min(starts).timestamp() * 1000),
                 end_ms=int(at.floor("min").timestamp() * 1000) - 1,
                 max_bars=int(cfg.get("live", {}).get("max_catchup_minutes", 10080)))
@@ -202,26 +203,26 @@ def _collect_market(conn, cfg, book_provider=None):
     mc = cfg.get("macro", {})
     if mc.get("enabled"):
         try:
-            result["macro"] = macro_feed.etf_flow_bias(mc.get("asset", "BTC"), mc.get("lookback_days", 5),
+            result["macro"] = observe(macro_feed.etf_flow_bias, mc.get("asset", "BTC"), mc.get("lookback_days", 5),
                                                      mc.get("block_threshold_musd", 0))
         except FEED_ERRORS:
             result["macro"] = {"available": False, "bias": "unavailable"}
     if cfg.get("news", {}).get("enabled"):
         try:
-            result["news"] = news_feed.news_gate(cfg)
+            result["news"] = observe(news_feed.news_gate, {"news": cfg["news"]})
         except FEED_ERRORS:
             result["news"] = {"block": cfg["news"].get("fail_closed", False), "unavailable": True}
     if (cfg.get("execution", {}).get("require_entry_rules", False)
             or cfg.get("execution", {}).get("partial_exits", False)):
         for sym in sorted({a["symbol"] for a in agents} | {p.symbol for p in positions.values()}):
             try:
-                result["rules"][sym] = exchange_rules.entry_rules(sym)
+                result["rules"][sym] = observe(exchange_rules.entry_rules, sym)
             except FEED_ERRORS:
                 continue
     if cfg.get("execution", {}).get("use_order_book", False):
         for sym in sorted({sym for sym, _ in pairs}):
             try:
-                result["books"][sym] = (book_provider or market_data.rest_book)(sym)
+                result["books"][sym] = observe(book_provider or market_data.rest_book, sym)
             except FEED_ERRORS:
                 continue
     result["collection_seconds"] = time.monotonic() - started
