@@ -50,7 +50,8 @@ def diagnostics(conn, cfg):
             "candidate_snapshot_failure": db.get_runtime_state(conn, "candidate_snapshot_failure"),
             "expected_model_version": MODEL_VERSION,
             "active_trials": active, "capacity": cfg.get("forward", {}).get("max_active_trials", 4),
-            "candidate_count": len(candidates), "candidates": observations}
+            "candidate_count": len(candidates), "candidates": observations,
+            "trials": [trial for trial in reports(conn) if trial["status"] == "active"]}
 
 
 def enroll(conn, cfg):
@@ -121,6 +122,8 @@ def tick_all(conn, book_provider=None):
 
 
 def reports(conn):
+    from . import execution_report
+
     rows = conn.execute("SELECT * FROM forward_trials ORDER BY created_at").fetchall()
     result = []
     for row in rows:
@@ -131,6 +134,13 @@ def reports(conn):
             db._migrate(ledger)
             cfg = json.loads(row["config_json"])
             evidence = readiness.evaluate(ledger, cfg, frozen=row["status"] == "active", trial_count=len(rows))
+            health = json.loads(db.get_runtime_state(ledger, "execution_health", "{}"))
+            execution = execution_report.build(ledger)
+            observed = {key: health.get(key) for key in (
+                "at", "equity", "cash", "open_positions", "entry_reasons", "issues",
+                "quotes", "books", "position_gaps")}
             result.append({"id": row["id"], "created_at": row["created_at"], "status": row["status"],
-                           "genome": json.loads(row["genome_json"]), "evidence": evidence})
+                           "genome": json.loads(row["genome_json"]), "evidence": evidence,
+                           "execution": observed, "trade_metrics": execution["current"],
+                           "cash_reconciliation": execution["reconciliation"]})
     return result

@@ -84,9 +84,13 @@ class V4Tests(unittest.TestCase):
             with mock.patch.object(forward_trials, "trading_hash", return_value="one"):
                 self.assertEqual(forward_trials.enroll(conn, cfg), 1)
                 self.assertEqual(forward_trials.enroll(conn, cfg), 0)
+                stored = conn.execute("SELECT ledger FROM forward_trials").fetchone()[0]
                 reports = forward_trials.reports(conn)
                 self.assertFalse(reports[0]["evidence"]["real_orders_enabled"])
                 self.assertIn("observation_days", reports[0]["evidence"]["reasons"])
+                self.assertEqual(reports[0]["trade_metrics"]["closed_trades"], 0)
+                self.assertIsNone(reports[0]["execution"]["at"])
+                self.assertEqual(stored, conn.execute("SELECT ledger FROM forward_trials").fetchone()[0])
             before = conn.execute("SELECT ledger FROM forward_trials").fetchone()[0]
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM live_account").fetchone()[0], 0)
             cfg["forward"]["max_active_trials"] = 0
