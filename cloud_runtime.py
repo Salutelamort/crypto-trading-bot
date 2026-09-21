@@ -238,7 +238,7 @@ def main():
                                  make_handler(data_dir, status, panel_password, panel_user))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    paper, research, writer_lock = None, None, None
+    paper, research, observer, writer_lock = None, None, None, None
     try:
         if os.environ.get("PAPER_ENABLED", "false").lower() != "true":
             status["phase"] = "standby"
@@ -262,6 +262,7 @@ def main():
         # A fresh snapshot is required for readiness, not an old file from the last deploy.
         launch_wall = time.time()
         next_research, research_started, next_backup = 0, 0, 0
+        next_observer, observer_started = 0, 0
         while not stop.wait(1):
             if paper.poll() is not None:
                 raise RuntimeError(f"Paper process exited with code {paper.returncode}")
@@ -272,6 +273,22 @@ def main():
                 status["phase"] = "running"
             elif time.monotonic() - launched > 300:
                 raise RuntimeError("Paper startup did not produce a fresh heartbeat")
+            if observer is not None:
+                if observer.poll() is not None:
+                    status["observer"] = "idle" if observer.returncode == 0 else "failed_retry_pending"
+                    print(f"Trial observer exit code {observer.returncode}; {status['observer']}", flush=True)
+                    observer = None
+                    next_observer = time.monotonic() + 300
+                elif time.monotonic() - observer_started > 240:
+                    stop_child(observer)
+                    observer = None
+                    status["observer"] = "timeout"
+                    next_observer = time.monotonic() + 300
+            elif status["phase"] == "running" and time.monotonic() >= next_observer:
+                observer = subprocess.Popen([sys.executable, "-u", "-m", "src.trial_observer",
+                                             "--directory", str(data_dir)], cwd=ROOT)
+                observer_started = time.monotonic()
+                status["observer"] = "running"
             if research is not None:
                 if research.poll() is not None:
                     status["research"] = "idle" if research.returncode == 0 else "failed_retry_pending"
@@ -305,6 +322,7 @@ def main():
                     next_backup = time.monotonic() + 300
     finally:
         status["phase"] = "stopping"
+        stop_child(observer)
         stop_child(research)
         stop_child(paper)
         server.shutdown()

@@ -27,7 +27,14 @@ def admission_reasons(agent, cfg):
 
 
 def diagnostics(conn, cfg):
-    from . import trial_admission
+    from . import behavioral_diversity, trial_admission, trial_capture
+
+    observer = None
+    if cfg.get("forward", {}).get("behavioral_diversity", False):
+        try:
+            observer = trial_capture.load_report(cfg)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
     candidates = [a for a in db.get_agents(conn) if a["status"] in ("candidate", "promoted")]
     active = conn.execute("SELECT COUNT(*) FROM forward_trials WHERE status='active'").fetchone()[0]
@@ -43,6 +50,8 @@ def diagnostics(conn, cfg):
         observations.append({"agent_id": agent["id"], "symbol": agent["symbol"], "timeframe": agent["timeframe"],
             "status": agent["status"], "admission_reasons": admission_reasons(agent, cfg),
             "diversity_reasons": trial_admission.reasons(json.loads(agent["genome"]), active_genomes, cfg.get("forward", {})),
+            "behavioral_evidence": (observer or {}).get("candidates", {}).get(
+                behavioral_diversity.identity(json.loads(agent["genome"])), {"status": "pending"}),
             "model_version": agent.get("model_version"),
             "test_trades": agent.get("test_trades"), "test_return": agent.get("test_return"),
             "test_pf": agent.get("test_pf"), "last_observed_bar": signals[0][0] if signals else None,
@@ -61,7 +70,7 @@ def diagnostics(conn, cfg):
 
 
 def enroll(conn, cfg):
-    from . import trial_admission
+    from . import behavioral_diversity, trial_admission, trial_capture
 
     policy = cfg.get("forward", {})
     if not policy.get("enabled", False):
@@ -70,6 +79,14 @@ def enroll(conn, cfg):
     # A changed implementation invalidates continuation of a frozen code experiment.
     conn.execute("UPDATE forward_trials SET status='version_changed' WHERE status='active' AND source_hash<>?", (source,))
     conn.commit()
+    observer = None
+    if policy.get("behavioral_diversity", False):
+        try:
+            observer = trial_capture.load_report(cfg)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if observer is not None:
+            trial_capture.enable(conn, observer)
     active_genomes, decisions = trial_admission.reconcile(conn, policy)
     db.set_runtime_state(conn, "forward_diversity_decisions", json.dumps(decisions))
     count = len(active_genomes)
@@ -84,6 +101,12 @@ def enroll(conn, cfg):
         genome = json.loads(agent["genome"])
         if trial_admission.reasons(genome, active_genomes, policy):
             continue
+        if policy.get("behavioral_diversity", False):
+            evidence = (observer or {}).get("candidates", {}).get(behavioral_diversity.identity(genome), {})
+            active_ids = {r[0] for r in conn.execute("SELECT id FROM forward_trials WHERE status='active'")}
+            if (not evidence.get("complete") or not active_ids.issubset(set(evidence.get("active_trial_ids", [])))
+                    or active_ids.intersection(evidence.get("similar_to", []))):
+                continue
         frozen_cfg = copy.deepcopy(cfg)
         frozen_cfg["forward"] = {"enabled": False}
         frozen_cfg["reconciliation"] = {"enabled": False}

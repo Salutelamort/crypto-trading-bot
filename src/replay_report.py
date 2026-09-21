@@ -107,7 +107,8 @@ def compare(state, decisions, actual):
             compared += 1
             if signal != int(expected_signal.loc[stamp]):
                 mismatches.append({"bar_at": bar_at, "live": signal, "backtest": int(expected_signal.loc[stamp])})
-    reference = backtest.run(g, frame, cfg, trade_start=start, record_orders=True)
+    reference = backtest.run(g, frame, cfg, trade_start=start, record_orders=True,
+                             initial_state=state.get("initial_state"))
     live = {}
     for fill in actual:
         stamp = pd.Timestamp(fill["ts"])
@@ -142,7 +143,10 @@ def compare(state, decisions, actual):
                   reference_orders=len(reference["orders"]), matched_orders=len(matches),
                   missing_paper_orders=len(missing), unmatched_paper_groups=len(live),
                   matches=matches[-50:], missing=missing[-50:], decision_reasons=dict(reasons))
-    result["cost_evidence"] = cost_evidence(matches, data_gaps=gaps, signal_mismatches=len(mismatches))
+    initial_gap = bool(state.get("initial_partial_bar_excluded"))
+    result["initial_partial_bar_excluded"] = initial_gap
+    result["initial_position_seeded"] = bool(state.get("initial_state", {}).get("position"))
+    result["cost_evidence"] = cost_evidence(matches, data_gaps=gaps + int(initial_gap), signal_mismatches=len(mismatches))
     return result
 
 

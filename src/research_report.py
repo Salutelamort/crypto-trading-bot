@@ -56,6 +56,8 @@ class ResearchReport:
                    "largest_measured_stage": max(stages, key=stages.get),
                    "evaluations_per_second": self.counters["evaluations"] / elapsed if elapsed > 0 else 0,
                    "delivery": "stored_for_assistant_review_not_pushed_to_chat"}
+        payload["family_productivity"] = getattr(self, "family_productivity", {})
+        payload["productivity_scope"] = "research_quality_not_promotion_deduplicated_last_5000_proposals"
         self.directory.mkdir(parents=True, exist_ok=True)
         temp = self.directory / "research-report.tmp"
         temp.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")

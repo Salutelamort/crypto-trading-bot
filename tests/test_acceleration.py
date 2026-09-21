@@ -105,7 +105,7 @@ class AccelerationTests(unittest.TestCase):
         restored = GuidedSearch(conn, capacity=2)
         self.assertEqual(search.entries, restored.entries)
         self.assertEqual(len(restored.entries), 2)
-        self.assertNotIn("total_return", db.get_runtime_state(conn, KEY))
+        self.assertTrue(all(entry["train"]["total_return"] == -999 for entry in json.loads(db.get_runtime_state(conn, KEY))))
         keys = [("SYN", "4h")]
         self.assertEqual(search.propose(keys, random.Random(7)), restored.propose(keys, random.Random(7)))
         before = copy.deepcopy(restored.entries)

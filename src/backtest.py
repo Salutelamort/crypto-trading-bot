@@ -24,7 +24,7 @@ _exit_levels = core.exit_levels
 
 
 def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=True,
-        trade_start=None, record_orders=False) -> dict:
+        trade_start=None, record_orders=False, initial_state=None) -> dict:
     """
     Симулирует одного агента на исторических данных. Поддерживает ТРИ состояния:
     long (+1), short (-1), кэш (0). Возвращает словарь метрик + кривую equity.
@@ -55,7 +55,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     n = len(df)
     atr_arr = ind.atr(df, risk.get("atr_period", 14)).values if risk.get("atr_stop") else [None] * n
 
-    if not record_trades and not record_orders and trade_start is None and cfg.get("evolution", {}).get("compiled_backtest", False):
+    if initial_state is None and not record_trades and not record_orders and trade_start is None and cfg.get("evolution", {}).get("compiled_backtest", False):
         from . import backtest_kernel
         if backtest_kernel.eligible(opened, close, high, low, sig_arr, fee, slip):
             equity_curve, period_returns, trade_results = backtest_kernel.run_arrays(
@@ -79,6 +79,22 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
     entry_index = 0
     prev_equity = cash
     cooldown_until = 0    # до этого бара новые входы запрещены (анти-переторговля)
+    seeded = bool(initial_state and initial_state.get("position"))
+    if initial_state:
+        cash = float(initial_state["cash"])
+        prev_equity = float(initial_state["equity"])
+        if seeded:
+            position = initial_state["position"]
+            in_pos = True
+            direction = int(position["direction"])
+            entry_exec = float(position["entry_price"])
+            notional = float(position["notional"])
+            extreme = float(position["peak_price"])
+            atr_entry = position.get("atr")
+            for field, setting in (("stop_mult", "atr_stop_mult"), ("take_mult", "atr_take_mult"),
+                                   ("trail_mult", "atr_trail_mult")):
+                if position.get(field) is not None:
+                    risk[setting] = position[field]
 
     def close_pos(exit_price, reason):
         nonlocal cash, in_pos, direction, cooldown_until
@@ -93,7 +109,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
                               "reason": reason})
         trade_results.append(net_pnl)
         if record_trades:
-            trade_log.append({"entry_at": df.index[entry_index].isoformat(),
+            trade_log.append({"entry_at": (initial_state["position"]["opened_at"] if seeded else df.index[entry_index].isoformat()),
                               "exit_at": df.index[i].isoformat(), "direction": direction,
                               "entry": entry_exec, "exit": exit_exec, "reason": reason,
                               "net_pnl": net_pnl})
@@ -106,6 +122,10 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
         price = close[i]
         s = int(sig_arr[i])
         if trade_start is not None and df.index[i] < pd.Timestamp(trade_start):
+            if initial_state is not None:
+                equity_curve.append(prev_equity)
+                period_returns.append(0.0)
+                continue
             s = 0
         closed_this_bar = False
 
@@ -126,6 +146,7 @@ def run(genome: dict, df: pd.DataFrame, cfg: dict, sig=None, *, record_trades=Tr
                 extreme = max(extreme, high[i]) if direction == 1 else min(extreme, low[i])
 
         if (not in_pos) and not closed_this_bar and s != 0 and i >= cooldown_until:
+            seeded = False
             entry_index = i
             direction = s
             # волатильность-таргетинг: доля от риска до стопа (risk parity)

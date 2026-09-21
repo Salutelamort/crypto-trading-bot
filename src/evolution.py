@@ -18,6 +18,7 @@
 import copy
 import json
 import random
+import time
 from contextlib import nullcontext
 
 import pandas as pd
@@ -270,7 +271,9 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
         # добиваем случайными по всем парам (символ × таймфрейм)
         while len(new_genomes) < need:
             # At least a quarter of slots remain fresh random exploration.
-            if len(new_genomes) < int(max(need, 0) * 0.75):
+            if int(max(need, 0) * .5) <= len(new_genomes) < int(max(need, 0) * .7):
+                proposal, origin = search.propose(keys, rng, activity=True)
+            elif len(new_genomes) < int(max(need, 0) * 0.75):
                 proposal, origin = search.propose(keys, rng)
             else:
                 sym, tf = rng.choice(keys)
@@ -309,24 +312,38 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
                     report.counters["insufficient_history"] += 1
                 continue
             hits = cache.hits
+            evaluated_at = time.perf_counter()
             try:
                 with report.stage("candidate_evaluation") if report else nullcontext():
                     train_m, test_m, cons = cache.evaluate(g, df, cfg, _evaluate_candidate)
             except bt.TrainingRejected:
+                search.outcome(g, time.perf_counter() - evaluated_at, False)
                 screened[0] += 1
                 if report:
                     report.screened(g)
                 continue
             if report:
                 report.evaluation(g, train_m, test_m, cache.hits > hits)
+            policy = cfg["supervisor"]
+            qualified = (test_m["total_return"] > 0 and test_m["num_trades"] >= policy.get("promote_min_trades", 20)
+                         and test_m["profit_factor"] >= policy.get("promote_min_pf", 1.1)
+                         and cons >= policy.get("promote_min_consistency", .6)
+                         and test_m.get("stress_return", -1) > 0
+                         and strategy_audit.passed(test_m.get("signal_audit")))
+            search.outcome(g, time.perf_counter() - evaluated_at, qualified)
             if "returns" in test_m:
                 returns_cache.evaluate(g, df, cfg, lambda *_, metrics=test_m: common_daily_returns(metrics["returns"]))
-            search.record(g, train_m)
+            cut = int(len(df) * cfg["train_ratio"])
+            days = (df.index[cut - 1] - df.index[0]).total_seconds() / 86400 if cut > 1 else 0
+            search.record(g, {**train_m, "observation_days": days})
             evaluated.append((g, train_m, test_m, cons))
             if len(evaluated) >= 32:
                 persist_candidates()
         persist_candidates()
-        search.save()
+        if report:
+            report.counters["productivity_families"] = len(search.productivity["families"])
+            report.counters["productivity_qualified"] = sum(f["qualified"] for f in search.productivity["families"].values())
+            report.family_productivity = search.productivity["families"]
 
         # 3. Отбор: выживают лучшие С КВОТОЙ на символ (диверсификация генофонда).
         alive = db.get_agents(conn, "candidate")
@@ -360,3 +377,5 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
             print(f"   #{a['id']} {g['type']:14s} {a['symbol']:8s} {a['timeframe']:>3s} "
                   f"train_sh={a['train_sharpe']:.2f} test_sh={a['test_sharpe']:.2f} "
                   f"cons={a['consistency']:.2f} trades={a['test_trades']}")
+
+    search.save()

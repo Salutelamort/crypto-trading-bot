@@ -21,6 +21,8 @@ from src import (
 
 
 def write_summary(conn, cfg, path="state/latest.json"):
+    from src.trial_observations import record
+
     quality = execution_report.build(conn)
     health = quality["health"]
     payload = {"updated_at": db.now_iso(), "experiment_id": quality["current_experiment"],
@@ -31,6 +33,10 @@ def write_summary(conn, cfg, path="state/latest.json"):
                "forward_trials": forward_trials.reports(conn)}
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        record(target.parent, payload["forward_trials"])
+    except (OSError, ValueError, TypeError) as error:
+        print(f"Trial observation counters failed: {type(error).__name__}; retry next cycle", flush=True)
     temp = target.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8")
     temp.replace(target)
