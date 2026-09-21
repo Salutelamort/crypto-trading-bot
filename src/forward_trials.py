@@ -27,10 +27,14 @@ def admission_reasons(agent, cfg):
 
 
 def diagnostics(conn, cfg):
+    from . import trial_admission
+
     candidates = [a for a in db.get_agents(conn) if a["status"] in ("candidate", "promoted")]
     active = conn.execute("SELECT COUNT(*) FROM forward_trials WHERE status='active'").fetchone()[0]
     experiment = db.get_runtime_state(conn, "current_experiment")
     observations = []
+    active_genomes = [json.loads(row[0]) for row in conn.execute(
+        "SELECT genome_json FROM forward_trials WHERE status='active'")]
     for agent in candidates:
         decisions = conn.execute("SELECT bar_at,payload FROM replay_decisions WHERE run_id=? ORDER BY bar_at DESC LIMIT 1000",
                                  (f"{experiment}:{agent['id']}",)).fetchall()
@@ -38,6 +42,7 @@ def diagnostics(conn, cfg):
         nonzero = next((stamp for stamp, value in signals if any(s != 0 for s in value["signals"])), None)
         observations.append({"agent_id": agent["id"], "symbol": agent["symbol"], "timeframe": agent["timeframe"],
             "status": agent["status"], "admission_reasons": admission_reasons(agent, cfg),
+            "diversity_reasons": trial_admission.reasons(json.loads(agent["genome"]), active_genomes, cfg.get("forward", {})),
             "model_version": agent.get("model_version"),
             "test_trades": agent.get("test_trades"), "test_return": agent.get("test_return"),
             "test_pf": agent.get("test_pf"), "last_observed_bar": signals[0][0] if signals else None,
@@ -51,10 +56,13 @@ def diagnostics(conn, cfg):
             "expected_model_version": MODEL_VERSION,
             "active_trials": active, "capacity": cfg.get("forward", {}).get("max_active_trials", 4),
             "candidate_count": len(candidates), "candidates": observations,
-            "trials": [trial for trial in reports(conn) if trial["status"] == "active"]}
+            "trials": [trial for trial in reports(conn) if trial["status"] == "active"],
+            "diversity_decisions": json.loads(db.get_runtime_state(conn, "forward_diversity_decisions", "[]"))}
 
 
 def enroll(conn, cfg):
+    from . import trial_admission
+
     policy = cfg.get("forward", {})
     if not policy.get("enabled", False):
         return 0
@@ -62,7 +70,9 @@ def enroll(conn, cfg):
     # A changed implementation invalidates continuation of a frozen code experiment.
     conn.execute("UPDATE forward_trials SET status='version_changed' WHERE status='active' AND source_hash<>?", (source,))
     conn.commit()
-    count = conn.execute("SELECT COUNT(*) FROM forward_trials WHERE status='active'").fetchone()[0]
+    active_genomes, decisions = trial_admission.reconcile(conn, policy)
+    db.set_runtime_state(conn, "forward_diversity_decisions", json.dumps(decisions))
+    count = len(active_genomes)
     registered = 0
     candidates = sorted(db.get_agents(conn), key=lambda a: a.get("test_sharpe") or -99, reverse=True)
     for agent in candidates:
@@ -72,6 +82,8 @@ def enroll(conn, cfg):
         if admission_reasons(agent, cfg):
             continue
         genome = json.loads(agent["genome"])
+        if trial_admission.reasons(genome, active_genomes, policy):
+            continue
         frozen_cfg = copy.deepcopy(cfg)
         frozen_cfg["forward"] = {"enabled": False}
         frozen_cfg["reconciliation"] = {"enabled": False}
@@ -95,6 +107,7 @@ def enroll(conn, cfg):
                      (trial_id, db.now_iso(), source, json.dumps(frozen_cfg), json.dumps(genome), blob))
         conn.commit()
         count += 1
+        active_genomes.append(genome)
         registered += 1
     return registered
 

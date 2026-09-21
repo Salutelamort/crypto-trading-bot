@@ -226,6 +226,9 @@ reconciliation:
 forward:
   enabled: true
   max_active_trials: 4
+  max_per_family: 1 # same symbol + strategy, across all timeframes
+  max_per_symbol: 2
+  max_per_strategy: 2
 
 # Это критерии для рассмотрения человеком, не автоматический допуск к деньгам.
 readiness:
