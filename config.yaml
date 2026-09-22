@@ -41,6 +41,7 @@ history_days: 1095         # 3 года: захватываем РАЗНЫЕ р�
 train_ratio: 0.50          # первая половина данных — in-sample (фитнес отбора)
 test_ratio: 0.50           # вторая половина — validation, делится на окна ниже
 validation:
+  trade_concentration_enabled: true
   parameter_stability_enabled: true
   signal_audit_enabled: true # causality and live 400-bar history agreement before admission
   cost_stress_multipliers: [2.0, 3.0] # стратегия должна выдержать повышенные комиссии и проскальзывание

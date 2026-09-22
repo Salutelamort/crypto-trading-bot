@@ -17,6 +17,7 @@ import datetime
 import json
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import yaml
@@ -30,6 +31,7 @@ from src import (
     live_trade,
     macro_feed,
     news_feed,
+    research_profile,
     research_report,
     supervisor,
 )
@@ -145,7 +147,8 @@ def _learn(conn, cfg, args, report):
                             cfg["evolution"].get("evaluation_cache_mb", 32) * 1024 * 1024)
     returns_cache = EvaluationCache(2048, 8 * 1024 * 1024)
     while True:
-        evolution.evolve(conn, cfg, data, report=report, cache=cache, returns_cache=returns_cache)
+        with research_profile.sample(report) if cycles == 0 else nullcontext():
+            evolution.evolve(conn, cfg, data, report=report, cache=cache, returns_cache=returns_cache)
         cycles += 1
         report.counters["cycles"] = cycles
         report.counters["cache_retained_bytes"] = cache.bytes

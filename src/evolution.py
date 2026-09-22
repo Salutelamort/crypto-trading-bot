@@ -65,6 +65,14 @@ def _evaluate(genome, df, cfg, *, screen_training=False):
             audit_ok = neighborhood["status"] == "passed"
             if not audit_ok:
                 test["signal_audit"]["status"] = "failed"
+    if plausible and audit_ok and cfg.get("validation", {}).get("trade_concentration_enabled", False):
+        from . import robustness
+
+        concentration = robustness.audit(genome, df.iloc[:int(len(df) * cfg["train_ratio"])], cfg)
+        test.setdefault("signal_audit", {})["trade_concentration"] = concentration
+        if concentration["status"] != "passed":
+            test["signal_audit"]["status"] = "failed"
+            audit_ok = False
     if factors and plausible and audit_ok:
         start = int(len(df) * cfg["train_ratio"]) + cfg.get("validation", {}).get("embargo_bars", 0)
         signal = gn.signal(genome, df, cfg["risk"].get("allow_short", False)).shift(
@@ -331,6 +339,8 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
                          and test_m.get("stress_return", -1) > 0
                          and strategy_audit.passed(test_m.get("signal_audit")))
             search.outcome(g, time.perf_counter() - evaluated_at, qualified)
+            if report and qualified:
+                report.qualified.add(json.dumps(g, sort_keys=True))
             if "returns" in test_m:
                 returns_cache.evaluate(g, df, cfg, lambda *_, metrics=test_m: common_daily_returns(metrics["returns"]))
             cut = int(len(df) * cfg["train_ratio"])

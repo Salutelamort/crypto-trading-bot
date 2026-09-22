@@ -105,6 +105,8 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
 
 
 def main():
+    from src.execution_tape import Recorder
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--window-minutes", type=float, default=0)
@@ -122,12 +124,13 @@ def main():
     if cfg.get("execution", {}).get("use_websocket", False):
         stream.start()
     deadline = time.monotonic() + args.window_minutes * 60 if args.window_minutes > 0 else None
+    recorder = Recorder(args.state_dir, stream)
     try:
         with closing(db.connect(cfg["db_path"])) as conn:
             while True:
                 started = time.monotonic()
                 # Exceptions are not treated as successful samples or silently swallowed.
-                cycle(conn, cfg, stream.book, str(Path(args.state_dir) / "latest.json"))
+                recorder.run(cycle, conn, cfg, str(Path(args.state_dir) / "latest.json"))
                 if args.once or (deadline is not None and time.monotonic() >= deadline):
                     break
                 delay = max(0, cfg.get("live", {}).get("interval_seconds", 60) - (time.monotonic() - started))
@@ -135,6 +138,7 @@ def main():
                     delay = min(delay, max(0, deadline - time.monotonic()))
                 time.sleep(delay)
     finally:
+        recorder.close()
         stream.close()
 
 

@@ -88,6 +88,7 @@ def compare(state, decisions, actual):
     frame = frame[frame.index + step <= until]
     start = pd.Timestamp(state["start"])
     result = {"scope": "recorded_closed_bars", "start": state["start"],
+              "signal_comparison_status": "not_observed", "order_comparison_status": "not_observed",
               "status": "collecting", "symbol": g["symbol"], "timeframe": g["timeframe"],
               "limitations": ["candle_close_vs_intrabar_execution", "shared_portfolio_vs_isolated_strategy",
                               "no_real_exchange_fills"], "recording_limit_reached": state.get("recording_limit_reached", False)}
@@ -143,10 +144,20 @@ def compare(state, decisions, actual):
                   reference_orders=len(reference["orders"]), matched_orders=len(matches),
                   missing_paper_orders=len(missing), unmatched_paper_groups=len(live),
                   matches=matches[-50:], missing=missing[-50:], decision_reasons=dict(reasons))
+    observed_signal_bars = sum(bool(value["signals"]) for stamp, value in decisions.items()
+                               if pd.Timestamp(stamp) in observed.index)
+    result["signal_coverage"] = {"observed_bars": observed_signal_bars,
+                                 "closed_bars": len(observed),
+                                 "fraction": observed_signal_bars / len(observed)}
+    result["signal_comparison_status"] = ("mismatch" if mismatches else
+        "not_observed" if not compared else "complete" if observed_signal_bars == len(observed) else "partial")
+    result["order_comparison_status"] = ("mismatch" if missing or live else
+        "matched" if matches else "no_orders")
     initial_gap = bool(state.get("initial_partial_bar_excluded"))
     result["initial_partial_bar_excluded"] = initial_gap
     result["initial_position_seeded"] = bool(state.get("initial_state", {}).get("position"))
-    result["cost_evidence"] = cost_evidence(matches, data_gaps=gaps + int(initial_gap), signal_mismatches=len(mismatches))
+    result["cost_evidence"] = cost_evidence(matches,
+        data_gaps=gaps + int(initial_gap) + int(observed_signal_bars < len(observed)), signal_mismatches=len(mismatches))
     return result
 
 

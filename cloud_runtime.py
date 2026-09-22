@@ -137,6 +137,16 @@ def monitor_payload(data_dir, status, now=None):
                               and status.get("research") not in ("timeout", "failed_retry_pending"))
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass  # Missing/invalid evidence is unhealthy, never a successful empty response.
+    if status.get("diagnostics_required"):
+        for name, filename, max_age in (("execution_tape", "execution-tape-status.json", 180),
+                                        ("shadow_replay", "shadow-comparison.json", 900)):
+            checks[name] = False
+            try:
+                evidence = json.loads((data_dir / filename).read_text(encoding="utf-8"))
+                observed_age = (now - datetime.fromisoformat(evidence["updated_at"])).total_seconds()
+                checks[name] = 0 <= observed_age <= max_age
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
     contract = None
     try:
         contract = describe(ROOT, data_dir / "bot.db")
@@ -226,7 +236,7 @@ def main():
     data_dir = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
     if not data_dir.is_dir() or not os.path.ismount(data_dir):
         raise RuntimeError("Persistent volume is not mounted; refusing ephemeral paper state")
-    status = {"phase": "starting", "real_orders_enabled": False, "research": "waiting"}
+    status = {"phase": "starting", "real_orders_enabled": False, "research": "waiting", "diagnostics_required": True}
     stop = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_args: stop.set())

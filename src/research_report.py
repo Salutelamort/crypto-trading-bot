@@ -15,6 +15,7 @@ class ResearchReport:
         self.started = time.monotonic()
         self.started_at = db.now_iso()
         self.seen = set()
+        self.qualified = set()
         self.counters = Counter()
         self.reasons = Counter()
         self.seconds = Counter()
@@ -57,6 +58,9 @@ class ResearchReport:
                    "evaluations_per_second": self.counters["evaluations"] / elapsed if elapsed > 0 else 0,
                    "delivery": "stored_for_assistant_review_not_pushed_to_chat"}
         payload["family_productivity"] = getattr(self, "family_productivity", {})
+        payload["unique_quality_candidates_this_run"] = len(self.qualified)
+        payload["unique_quality_candidates_per_hour"] = len(self.qualified) * 3600 / elapsed if elapsed > 0 else 0
+        payload["sampled_cpu_profile"] = getattr(self, "cpu_profile", {"status": "not_sampled"})
         payload["productivity_scope"] = "research_quality_not_promotion_deduplicated_last_5000_proposals"
         self.directory.mkdir(parents=True, exist_ok=True)
         temp = self.directory / "research-report.tmp"

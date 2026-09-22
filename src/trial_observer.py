@@ -148,6 +148,10 @@ def run(directory, config):
         tid: {key: value[key] for key in ("genome", "holding", "pending_exits", "entry_history", "reconciliation")}
         for tid, value in result["trials"].items()}, "candidate_count": len(result["candidates"])}
     print("TRIAL_OBSERVER " + json.dumps(summary, allow_nan=False), flush=True)
+    if (directory / "execution-tapes").exists():
+        from . import shadow_replay
+
+        shadow_replay.run_pair(directory)
     return result
 
 

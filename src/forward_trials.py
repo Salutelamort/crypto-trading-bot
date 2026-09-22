@@ -10,6 +10,8 @@ from .versioning import trading_config, trading_hash
 
 
 def admission_reasons(agent, cfg):
+    from . import robustness
+
     reasons = []
     if agent["status"] not in ("candidate", "promoted"):
         reasons.append("inactive_candidate")
@@ -23,6 +25,8 @@ def admission_reasons(agent, cfg):
         reasons.append("fewer_than_20_validation_trades")
     if cfg.get("supervisor", {}).get("require_signal_audit", False) and not strategy_audit.passed(agent.get("signal_audit")):
         reasons.append("signal_or_parameter_audit_not_passed")
+    if cfg.get("validation", {}).get("trade_concentration_enabled", False) and not robustness.passed(agent.get("signal_audit")):
+        reasons.append("trade_concentration_not_passed")
     return reasons
 
 
