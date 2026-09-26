@@ -6,12 +6,56 @@ from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import pandas as pd
 from test_live_execution import config
 
-from src import db, live_trade, risk, runtime_resources
+from src import (
+    db,
+    live_trade,
+    observer_cache,
+    risk,
+    runtime_resources,
+    shadow_replay,
+    trial_observer,
+)
 
 
 class RuntimeResourcesTests(unittest.TestCase):
+    def test_profile_cache_round_trips_exactly_and_invalidates_changed_inputs(self):
+        frame = pd.DataFrame({"close": [1., 2.]}, index=pd.date_range("2026-01-01", periods=2, tz="UTC"))
+        value = pd.DataFrame({"returns": [.12345678901234567, .2222222222222222], "entries": [1, 2]}, index=frame.index)
+        calculate = mock.Mock(return_value=value)
+        cache = {}
+        observer_cache.profile({}, frame, {}, "source", {}, cache, calculate)
+        cache = json.loads(json.dumps(cache))
+        got = observer_cache.profile({}, frame, {}, "source", cache, {}, calculate)
+        pd.testing.assert_frame_equal(value, got, check_exact=True, check_freq=False)
+        calculate.assert_called_once()
+        changed = frame.copy()
+        changed.iloc[0, 0] = 3
+        observer_cache.profile({}, changed, {}, "source", cache, {}, calculate)
+        observer_cache.profile({}, frame, {"cost": 1}, "source", cache, {}, calculate)
+        observer_cache.profile({}, frame, {}, "new-source", cache, {}, calculate)
+        self.assertEqual(calculate.call_count, 4)
+
+    def test_identical_execution_stops_only_after_successful_calibration(self):
+        previous = {"comparison": "one", "execution_hash": "same", "trials": [{
+            "status": "comparable", "ticks": 6, "equity_difference": 0,
+            "baseline_reconciled": True, "challenger_reconciled": True}]}
+        self.assertTrue(shadow_replay.calibration_complete(previous, "one", "same", "same"))
+        self.assertFalse(shadow_replay.calibration_complete(previous, "new-session", "same", "same"))
+        self.assertFalse(shadow_replay.calibration_complete(previous, "one", "same", "new-engine"))
+        previous["trials"][0]["equity_difference"] = .01
+        self.assertFalse(shadow_replay.calibration_complete(previous, "one", "same", "same"))
+
+    def test_frozen_holding_reference_does_not_recompute_history(self):
+        frame = pd.DataFrame(index=pd.date_range("2026-01-01", periods=0, tz="UTC"))
+        reference = {"reference_end": "2026-01-01T00:00:00Z", "historical_closed_trades": 30, "historical_p95_hours": 40}
+        with mock.patch.object(trial_observer.backtest, "run") as run:
+            result = trial_observer.holding_report({"timeframe": "1h"}, config(), frame, reference["reference_end"], [], "2026-02-01T00:00:00Z", reference)
+        run.assert_not_called()
+        self.assertEqual(result["historical_p95_hours"], 40)
+
     def test_subscriptions_cover_promoted_trials_and_legacy_inventory(self):
         with closing(db.connect(":memory:")) as conn:
             for symbol, status in (("BTCUSDT", "promoted"), ("ETHUSDT", "candidate")):

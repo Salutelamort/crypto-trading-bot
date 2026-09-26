@@ -8,18 +8,22 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from . import backtest, candidate_exchange, db, genome, replay_report
+from . import backtest, candidate_exchange, db, genome, observer_cache, replay_report
 from . import behavioral_diversity as behavior
 from . import data_feed as feed
 from . import execution_core as core
 
 
-def holding_report(g, cfg, frame, created_at, positions, at):
+def holding_report(g, cfg, frame, created_at, positions, at, reference=None):
     # Freeze the reference to data preceding admission; current profits do not tune it.
-    history = frame[frame.index + pd.Timedelta(milliseconds=feed._TF_MS[g["timeframe"]]) <= pd.Timestamp(created_at)]
-    trades = backtest.run(g, history, cfg)["trades"] if len(history) >= 100 else []
-    durations = [(pd.Timestamp(t["exit_at"]) - pd.Timestamp(t["entry_at"])).total_seconds() / 3600 for t in trades]
-    threshold = float(pd.Series(durations).quantile(.95)) if len(durations) >= 20 else None
+    if reference and reference.get("reference_end") == created_at:
+        count, threshold = reference["historical_closed_trades"], reference["historical_p95_hours"]
+    else:
+        history = frame[frame.index + pd.Timedelta(milliseconds=feed._TF_MS[g["timeframe"]]) <= pd.Timestamp(created_at)]
+        trades = backtest.run(g, history, cfg)["trades"] if len(history) >= 100 else []
+        durations = [(pd.Timestamp(t["exit_at"]) - pd.Timestamp(t["entry_at"])).total_seconds() / 3600 for t in trades]
+        count = len(durations)
+        threshold = float(pd.Series(durations).quantile(.95)) if count >= 20 else None
     step = pd.Timedelta(milliseconds=feed._TF_MS[g["timeframe"]])
     current = frame[frame.index + step <= pd.Timestamp(at)].tail(400)
     signal = (int(genome.signal(g, current, cfg["risk"].get("allow_short", False)).shift(
@@ -50,7 +54,7 @@ def holding_report(g, cfg, frame, created_at, positions, at):
             "status": "insufficient_history" if threshold is None else ("unusually_long" if age > threshold else "within_reference"),
             "stop": stop, "take_profit": take, "last_checked_at": pos.get("last_checked_at"),
             "exit_cursor_age_minutes": cursor_age, "current_signal": signal, "review_reasons": review})
-    return {"historical_closed_trades": len(durations), "historical_p95_hours": threshold,
+    return {"historical_closed_trades": count, "historical_p95_hours": threshold,
             "reference_end": created_at, "positions": observations, "automatic_close": False}
 
 
@@ -98,7 +102,11 @@ def run(directory, config):
             frames[key] = frame[frame.index + step <= pd.Timestamp(at)]
         return frames[key]
     result = {"updated_at": at, "source_hash": db._source_hash(),
-              "policy_hash": candidate_exchange.policy_hash(config), "trials": {}, "candidates": {}, "errors": []}
+              "policy_hash": candidate_exchange.policy_hash(config), "trials": {}, "candidates": {}, "errors": [],
+              "profile_cache": {}}
+    def profile_for(g, frame, cfg):
+        return observer_cache.profile(g, frame, cfg, result["source_hash"], previous.get("profile_cache", {}),
+                                      result["profile_cache"], behavior.profile)
     profiles = {}
     for row in rows:
         g, cfg = json.loads(row["genome_json"]), json.loads(row["config_json"])
@@ -122,10 +130,11 @@ def run(directory, config):
                     reconciliation["signal_observations"] = "not_recorded_in_frozen_ledger"
                     reconciliation["scope"] = "seeded_candle_vs_paper_orders_diagnostic_only"
                 result["trials"][row["id"]] = {"genome": g, "seed": state, "capture": replay, "reconciliation": reconciliation,
-                    "holding": holding_report(g, cfg, frame, row["created_at"], positions, health["at"]),
+                    "holding": holding_report(g, cfg, frame, row["created_at"], positions, health["at"],
+                        old.get("holding") if previous.get("source_hash") == result["source_hash"] else None),
                     "pending_exits": [r[0] for r in ledger.execute("SELECT key FROM runtime_state WHERE key LIKE 'exit_intent:%'")],
                     "entry_history": counters.get(row["id"], {"status": "not_observed"})}
-                profiles[row["id"]] = behavior.profile(g, frame, cfg)
+                profiles[row["id"]] = profile_for(g, frame, cfg)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as error:
             result["errors"].append({"trial_id": row["id"], "error": type(error).__name__})
     for candidate in candidates:
@@ -133,7 +142,7 @@ def run(directory, config):
         try:
             if not genome.validate_genome(g)[0]:
                 continue
-            profile = behavior.profile(g, frame_for(g), config)
+            profile = profile_for(g, frame_for(g), config)
             comparisons = {tid: behavior.compare(profile, other) for tid, other in profiles.items()}
             result["candidates"][behavior.identity(g)] = {"comparisons": comparisons,
                 "active_trial_ids": [row["id"] for row in rows],

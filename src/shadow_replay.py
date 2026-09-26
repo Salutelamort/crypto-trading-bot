@@ -20,6 +20,7 @@ import pandas as pd
 
 from . import db, execution_report, live_trade
 from .execution_tape import atomic_json, decode
+from .versioning import trading_hash
 
 
 def replay(ledger, cfg, tape):
@@ -136,6 +137,7 @@ def compare_arms(baseline, challenger):
                     and old.get("cash_reconciliation", {}).get("ok") and trial.get("cash_reconciliation", {}).get("ok"))
         delta = (trial["health"]["equity"] - old["health"]["equity"]) if complete else None
         comparisons.append({"trial_id": trial["trial_id"], "status": "comparable" if complete else "insufficient_evidence",
+                            "last_compared_tape": trial.get("last_tape"),
                             "ticks": trial["ticks"], "equity_difference": delta,
                             "baseline_gaps": old.get("gaps"), "challenger_gaps": trial["gaps"],
                             "baseline_reconciled": old.get("cash_reconciliation", {}).get("ok"),
@@ -144,6 +146,14 @@ def compare_arms(baseline, challenger):
             "baseline_source": baseline["source"], "challenger_source": challenger["source"],
             "trials": comparisons, "automatic_promotion": False,
             "scope": "isolated_paper_replay_not_forward_profit_evidence"}
+
+
+def calibration_complete(previous, comparison, baseline_hash, challenger_hash):
+    return (baseline_hash == challenger_hash and previous.get("comparison") == comparison
+            and previous.get("execution_hash") == challenger_hash and bool(previous.get("trials"))
+            and all(t.get("status") == "comparable" and t.get("ticks", 0) >= 6
+                    and t.get("equity_difference") == 0 and t.get("baseline_reconciled")
+                    and t.get("challenger_reconciled") for t in previous["trials"]))
 
 
 def run_pair(directory):
@@ -172,6 +182,15 @@ def run_pair(directory):
     if tape_status["source"] != db._source_hash():
         return {"status": "waiting_for_current_source_tape"}
     comparison = tape_status["comparison"]
+    baseline_hash, challenger_hash = trading_hash(baseline), trading_hash(root)
+    comparison_path = directory / "shadow-comparison.json"
+    previous = json.loads(comparison_path.read_text()) if comparison_path.exists() else {}
+    if calibration_complete(previous, comparison, baseline_hash, challenger_hash):
+        result = {**previous, "updated_at": db.now_iso(), "mode": "unchanged_execution_calibrated",
+                  "replay_paused": True, "reason": "execution_rules_unchanged_after_six_calibration_ticks"}
+        atomic_json(comparison_path, result)
+        print("SHADOW_COMPARISON " + json.dumps(result), flush=True)
+        return result
     seed_root = (directory / "shadow-seeds").resolve()
     old_seeds = sorted((p for p in seed_root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True) if seed_root.exists() else []
     for old in old_seeds[16:]:
@@ -188,6 +207,7 @@ def run_pair(directory):
                        stdout=subprocess.DEVNULL)
     result = compare_arms(*(json.loads((directory / ("shadow-" + arm + ".json")).read_text())
                             for arm in ("baseline", "challenger")))
+    result.update(comparison=comparison, execution_hash=challenger_hash, compared_at=result["updated_at"], replay_paused=False)
     atomic_json(directory / "shadow-comparison.json", result)
     print("SHADOW_COMPARISON " + json.dumps(result), flush=True)
     return result
