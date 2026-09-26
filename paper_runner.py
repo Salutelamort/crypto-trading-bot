@@ -106,6 +106,7 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
 
 def main():
     from src.execution_tape import Recorder
+    from src.runtime_resources import IdleMemory, required_symbols
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
@@ -119,18 +120,29 @@ def main():
     if args.db_path:
         cfg["db_path"] = args.db_path
     cfg.setdefault("runner", {})["candidate_path"] = str(Path(args.state_dir) / "candidates.json")
-    stream = market_data.BookStream(cfg["symbols"], cfg.get("execution", {}).get("max_quote_age_seconds", 5),
+    stream = market_data.BookStream([], cfg.get("execution", {}).get("max_quote_age_seconds", 5),
                                    require_depth=cfg.get("execution", {}).get("require_depth_entries", False))
     if cfg.get("execution", {}).get("use_websocket", False):
         stream.start()
     deadline = time.monotonic() + args.window_minutes * 60 if args.window_minutes > 0 else None
     recorder = Recorder(args.state_dir, stream)
+    memory = IdleMemory()
     try:
         with closing(db.connect(cfg["db_path"])) as conn:
             while True:
                 started = time.monotonic()
+                symbols = required_symbols(conn, cfg)
+                if symbols != stream.symbols:
+                    stream.close()
+                    stream = market_data.BookStream(symbols, cfg.get("execution", {}).get("max_quote_age_seconds", 5),
+                        require_depth=cfg.get("execution", {}).get("require_depth_entries", False))
+                    if cfg.get("execution", {}).get("use_websocket", False):
+                        stream.start()
+                    recorder.stream = stream
+                    print("MARKET_SUBSCRIPTIONS " + json.dumps({"symbols": sorted(symbols)}), flush=True)
                 # Exceptions are not treated as successful samples or silently swallowed.
                 recorder.run(cycle, conn, cfg, str(Path(args.state_dir) / "latest.json"))
+                memory.release()
                 if args.once or (deadline is not None and time.monotonic() >= deadline):
                     break
                 delay = max(0, cfg.get("live", {}).get("interval_seconds", 60) - (time.monotonic() - started))

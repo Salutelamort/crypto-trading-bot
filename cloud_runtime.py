@@ -233,6 +233,8 @@ def stop_child(child):
 
 
 def main():
+    from src.runtime_resources import release_file_cache
+
     data_dir = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
     if not data_dir.is_dir() or not os.path.ismount(data_dir):
         raise RuntimeError("Persistent volume is not mounted; refusing ephemeral paper state")
@@ -301,6 +303,7 @@ def main():
                 status["observer"] = "running"
             if research is not None:
                 if research.poll() is not None:
+                    release_file_cache(research_path)
                     status["research"] = "idle" if research.returncode == 0 else "failed_retry_pending"
                     next_research = time.monotonic() + (21600 if research.returncode == 0 else 1800)
                     print(f"Research exit code {research.returncode}; {status['research']}", flush=True)
@@ -323,6 +326,7 @@ def main():
                 slot = int(time.time() // 86400) % 7
                 try:
                     backup_database(data_dir / "bot.db", backups / f"paper-{slot}.db")
+                    release_file_cache(backups / f"paper-{slot}.db")
                     print(f"Verified SQLite backup: paper-{slot}.db on mounted volume", flush=True)
                     status["backup"] = "ok"
                     next_backup = time.monotonic() + 3600

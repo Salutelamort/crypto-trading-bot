@@ -134,6 +134,9 @@ class Recorder:
         return result
 
     def _writer(self):
+        from .runtime_resources import IdleMemory
+
+        memory = IdleMemory()
         while not self.stop.is_set() or not self.jobs.empty():
             try:
                 job, rows, post, threads = self.jobs.get(timeout=.2)
@@ -148,6 +151,9 @@ class Recorder:
                 print("EXECUTION_TAPE_ERROR " + type(exc).__name__, flush=True)
             finally:
                 self.jobs.task_done()
+                # Do not retain ledger BLOBs on the sleeping worker's stack.
+                del job, rows, post, threads
+                memory.release()
 
     def _save(self, job, rows, post):
         seeds = self.seeds / job["comparison"]
