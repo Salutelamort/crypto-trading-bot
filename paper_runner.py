@@ -105,11 +105,15 @@ def cycle(conn, cfg, book_provider=None, state_path="state/latest.json"):
 
 
 def main():
+    from collections import OrderedDict
+
+    from src.diagnostic_cache import _references
     from src.execution_tape import Recorder
     from src.json_memory import install
     from src.runtime_resources import IdleMemory, required_symbols
 
     install()
+    _references.set(OrderedDict())
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--window-minutes", type=float, default=0)

@@ -80,6 +80,7 @@ def record_decision(conn, cfg, aid, frame, signal, reason):
 
 
 def compare(state, decisions, actual):
+    from .diagnostic_cache import reference as cached_reference
     frame = pd.read_json(io.StringIO(state["bars"]), orient="split")
     frame.index = pd.to_datetime(frame.index, utc=True)
     g, cfg = state["genome"], state["config"]
@@ -96,8 +97,7 @@ def compare(state, decisions, actual):
     if observed.empty:
         return result
     gaps = int((observed.index.to_series().diff().dropna() != step).sum())
-    expected_signal = genome.signal(g, frame, cfg["risk"].get("allow_short", False)).shift(
-        cfg.get("execution", {}).get("signal_delay_bars", 1)).fillna(0).astype(int)
+    expected_signal, reference_orders = cached_reference(g, frame, cfg, start, state.get("initial_state"), backtest.run, genome.signal)
     compared, mismatches, reasons = 0, [], Counter()
     for bar_at, value in decisions.items():
         stamp = pd.Timestamp(bar_at)
@@ -108,8 +108,6 @@ def compare(state, decisions, actual):
             compared += 1
             if signal != int(expected_signal.loc[stamp]):
                 mismatches.append({"bar_at": bar_at, "live": signal, "backtest": int(expected_signal.loc[stamp])})
-    reference = backtest.run(g, frame, cfg, trade_start=start, record_orders=True,
-                             initial_state=state.get("initial_state"))
     live = {}
     for fill in actual:
         stamp = pd.Timestamp(fill["ts"])
@@ -118,7 +116,7 @@ def compare(state, decisions, actual):
             continue
         live.setdefault((bar.isoformat(), fill["side"]), []).append(fill)
     matches, missing = [], []
-    for order in reference["orders"]:
+    for order in reference_orders:
         key = (order["bar_at"], order["side"])
         fills = live.pop(key, [])
         if not fills:
@@ -141,7 +139,7 @@ def compare(state, decisions, actual):
     result.update(status="data_gap" if gaps else "compared", until=(observed.index[-1] + step).isoformat(),
                   closed_bars=len(observed), data_gaps=gaps, compared_signals=compared,
                   signal_mismatches=mismatches[:50], signal_mismatch_count=len(mismatches),
-                  reference_orders=len(reference["orders"]), matched_orders=len(matches),
+                  reference_orders=len(reference_orders), matched_orders=len(matches),
                   missing_paper_orders=len(missing), unmatched_paper_groups=len(live),
                   matches=matches[-50:], missing=missing[-50:], decision_reasons=dict(reasons))
     observed_signal_bars = sum(bool(value["signals"]) for stamp, value in decisions.items()

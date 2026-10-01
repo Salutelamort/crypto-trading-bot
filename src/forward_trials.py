@@ -163,6 +163,11 @@ def tick_all(conn, book_provider=None):
 
 def reports(conn):
     from . import execution_report
+    from .diagnostic_cache import report_entry
+
+    cached = report_entry(conn)
+    if cached is not None:
+        return cached
 
     rows = conn.execute("SELECT * FROM forward_trials ORDER BY created_at").fetchall()
     result = []
@@ -183,4 +188,5 @@ def reports(conn):
                            "genome": json.loads(row["genome_json"]), "evidence": evidence,
                            "execution": observed, "trade_metrics": execution["current"],
                            "cash_reconciliation": execution["reconciliation"]})
+    report_entry(conn, result)
     return result

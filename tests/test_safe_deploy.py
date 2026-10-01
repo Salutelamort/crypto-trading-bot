@@ -34,6 +34,7 @@ class SafeDeployTests(unittest.TestCase):
             argv = ["safe_deploy", "--project", "p", "--environment", "e", "--service", "s",
                     "--monitor-url", "https://example.test/monitor", "--upload-dir", directory, "--poll-seconds", "0"]
             with (patch("sys.argv", argv), patch.object(safe_deploy, "graphql", side_effect=api),
+                  patch.object(safe_deploy, "verify_performance"),
                   patch.object(safe_deploy, "healthy", side_effect=[old, new, old] if fail else [old, new, new, new]),
                   patch.object(safe_deploy.subprocess, "run", return_value=SimpleNamespace(stdout="https://example.test/?id=" + new_id)) as upload):
                 if incompatible:
@@ -46,6 +47,20 @@ class SafeDeployTests(unittest.TestCase):
 
     def test_success_needs_three_checks(self):
         self.run_deploy()
+
+    def test_performance_gate_rejects_failed_stale_and_missing_results(self):
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder)
+            with self.assertRaises(FileNotFoundError):
+                safe_deploy.verify_performance(stage)
+            with patch.object(safe_deploy.subprocess, "run", return_value=SimpleNamespace(stdout="current\n")):
+                for value in ({"passed": False, "source_hash": "current"},
+                              {"passed": True, "source_hash": "old"}):
+                    (stage / "performance-gate.json").write_text(json.dumps(value))
+                    with self.assertRaisesRegex(RuntimeError, "performance"):
+                        safe_deploy.verify_performance(stage)
+                (stage / "performance-gate.json").write_text(json.dumps({"passed": True, "source_hash": "current"}))
+                safe_deploy.verify_performance(stage)
 
     def test_crash_rolls_back_compatible_image(self):
         self.run_deploy(fail=True)

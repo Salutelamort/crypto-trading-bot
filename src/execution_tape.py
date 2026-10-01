@@ -70,6 +70,7 @@ class Recorder:
         self.sequence = None  # A restart explicitly breaks tape continuity.
         self.comparison = None
         self.last_log = 0.
+        self.last_timing_log = 0.
         self.worker = threading.Thread(target=self._writer, daemon=True, name="execution-tape-writer")
         self.worker.start()
 
@@ -88,6 +89,8 @@ class Recorder:
                                   "book": quote if valid else None})
 
     def run(self, cycle, conn, cfg, state_path):
+        captured_at = time.time()
+        started = time.monotonic()
         rows = []
         try:
             rows = [dict(r) for r in conn.execute("SELECT * FROM forward_trials WHERE status='active'")]
@@ -111,18 +114,29 @@ class Recorder:
                 pass
             return quote
 
-        result = cycle(conn, cfg, provider, state_path)  # Never catch or retry execution exceptions.
+        from .diagnostic_cache import report_scope
+
+        with report_scope():
+            result = cycle(conn, cfg, provider, state_path)  # Never catch or retry execution exceptions.
+        cycle_seconds = time.monotonic() - started
         try:
             post = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM forward_trials WHERE status='active'")}
             observations = []
+            shared = {}
             for state in states:
                 for (fn, arguments), value in state["values"].items():
                     name = "book" if fn is provider else fn.__module__ + "." + fn.__name__
                     observations.append({"provider": name, "arguments": arguments, "value": encode(value)})
+                    if name == "src.data_feed.fetch_recent" and isinstance(value, pd.DataFrame):
+                        from .shared_candles import pack
+
+                        args, _ = json.loads(arguments)
+                        shared[args[0] + "/" + args[1]] = pack(value)
             at = time.time_ns()
             if self.sequence is None:
                 self.comparison = self.source + "-" + str(at)
             job = {"schema_version": 1, "id": str(at), "previous": self.sequence, "source": self.source,
+                   "shared_candles": {"captured_at": captured_at, "frames": shared},
                    "comparison": self.comparison,
                    "wall_at": time.time(), "observations": observations, "books": books,
                    "trial_ids": sorted(set(post).intersection(r["id"] for r in rows))}
@@ -131,6 +145,10 @@ class Recorder:
         except (OSError, ValueError, TypeError, sqlite3.Error, queue.Full) as exc:
             self.sequence = None
             print("EXECUTION_TAPE_ERROR " + type(exc).__name__, flush=True)
+        if time.monotonic() - self.last_timing_log >= 300:
+            print("PAPER_TIMING " + json.dumps({"at": db.now_iso(), "cycle_seconds": cycle_seconds,
+                "total_seconds": time.monotonic() - started}), flush=True)
+            self.last_timing_log = time.monotonic()
         return result
 
     def _writer(self):
@@ -156,6 +174,9 @@ class Recorder:
                 memory.release()
 
     def _save(self, job, rows, post):
+        shared = job.pop("shared_candles", None)
+        if shared is not None:
+            atomic_json(self.directory / "shared-candles.json", shared)
         seeds = self.seeds / job["comparison"]
         seeds.mkdir(exist_ok=True)
         benchmarks_path = self.directory / "paper-benchmarks.json"

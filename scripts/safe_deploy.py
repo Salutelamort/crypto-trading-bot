@@ -38,6 +38,14 @@ def healthy(url):
         return None
 
 
+def verify_performance(stage):
+    performance = json.loads((stage / "performance-gate.json").read_text())
+    source = subprocess.run([sys.executable, "-c", "from src.db import _source_hash; print(_source_hash())"],
+                            cwd=stage, check=True, capture_output=True, text=True).stdout.strip()
+    if performance.get("passed") is not True or performance.get("source_hash") != source:
+        raise RuntimeError("Missing, failed or stale performance/equivalence gate")
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("project", "environment", "service", "monitor-url", "upload-dir"):
@@ -48,6 +56,7 @@ def main():
     args = parser.parse_args()
     stage = Path(args.upload_dir).resolve()
     manifest = json.loads((stage / "release-contract.json").read_text())
+    verify_performance(stage)
     baseline = healthy(args.monitor_url)
     listing = graphql("query($input:DeploymentListInput!){deployments(input:$input,first:1){edges{node{id status}}}}",
         {"input": {"projectId": args.project, "environmentId": args.environment, "serviceId": args.service}})

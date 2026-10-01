@@ -75,6 +75,15 @@ def seed(ledger, cfg, positions, at, timeframe):
 
 
 def run(directory, config):
+    from .diagnostic_cache import reference_scope
+
+    with reference_scope(Path(directory) / "reference-cache.json"):
+        return _run(directory, config)
+
+
+def _run(directory, config):
+    from .shared_candles import recent
+
     directory = Path(directory)
     target = directory / "trial-observer.json"
     try:
@@ -97,7 +106,7 @@ def run(directory, config):
     def frame_for(g):
         key = (g["symbol"], g["timeframe"])
         if key not in frames:
-            frame = feed.fetch_recent(*key, 1000)
+            frame = recent(directory, *key, 1000)
             step = pd.Timedelta(milliseconds=feed._TF_MS[g["timeframe"]])
             frames[key] = frame[frame.index + step <= pd.Timestamp(at)]
         return frames[key]

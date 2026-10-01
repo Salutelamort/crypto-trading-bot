@@ -287,6 +287,9 @@ def main():
                 raise RuntimeError("Paper startup did not produce a fresh heartbeat")
             if observer is not None:
                 if observer.poll() is not None:
+                    from src.runtime_resources import release_diagnostic_cache
+
+                    release_diagnostic_cache(data_dir)
                     status["observer"] = "idle" if observer.returncode == 0 else "failed_retry_pending"
                     print(f"Trial observer exit code {observer.returncode}; {status['observer']}", flush=True)
                     observer = None

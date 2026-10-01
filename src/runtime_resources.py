@@ -67,3 +67,13 @@ def release_file_cache(path):
         return True
     except OSError:
         return False
+
+
+def release_diagnostic_cache(directory):
+    """Completed, infrequently read diagnostics only; exclude active trading DBs."""
+    directory = Path(directory)
+    paths = [directory / "shadow-accounts.db", directory / "reference-cache.json"]
+    paths.extend((directory / "shadow-seeds").glob("*/*.db"))
+    # Retain the most recent tapes for the next observer; older tapes are cold.
+    paths.extend(sorted((directory / "execution-tapes").glob("*.json.gz"))[:-8])
+    return sum(release_file_cache(path) for path in paths)
