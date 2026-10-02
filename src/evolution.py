@@ -301,7 +301,7 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
                     aid = db.insert_agent(conn, candidate, candidate["symbol"], candidate["timeframe"], commit=False)
                     db.update_agent_metrics(conn, aid, train, test, consistency, commit=False)
                     if report:
-                        report.track_candidate(aid, candidate)
+                        report.track_candidate(aid, candidate, train, test, consistency)
                 if screened[0]:
                     previous = int(db.get_runtime_state(conn, "training_screened_trials", "0"))
                     db.set_runtime_state(conn, "training_screened_trials", str(previous + screened[0]), commit=False)

@@ -7,7 +7,7 @@ from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import db, strategy_audit
+from . import db, research_memory, strategy_audit
 
 
 class ResearchReport:
@@ -22,6 +22,7 @@ class ResearchReport:
         self.counters = Counter()
         self.reasons = Counter()
         self.seconds = Counter()
+        self.context = {"source_hash": db._source_hash()}
 
     @contextmanager
     def stage(self, name):
@@ -50,7 +51,7 @@ class ResearchReport:
         self.seen.add(hashlib.sha256(json.dumps(genome, sort_keys=True).encode()).hexdigest())
         self.counters["training_screen_rejections"] += 1
 
-    def track_candidate(self, agent_id, genome):
+    def track_candidate(self, agent_id, genome, train=None, test=None, consistency=None):
         """Track only intermediate qualifiers; bound memory and persisted output."""
         canonical = json.dumps(genome, sort_keys=True)
         if canonical not in self.qualified:
@@ -61,7 +62,11 @@ class ResearchReport:
         self.candidate_history[agent_id] = {
             "agent_id": agent_id, "genome": genome,
             "genome_hash": hashlib.sha256(canonical.encode()).hexdigest(),
-            "qualified_at": db.now_iso(), "status": "candidate", "decisions": []}
+            "qualified_at": db.now_iso(), "status": "candidate", "decisions": [],
+            "metrics": {"train": {k: (train or {}).get(k) for k in ("sharpe", "total_return", "num_trades")},
+                        "validation": {k: (test or {}).get(k) for k in (
+                            "sharpe", "total_return", "num_trades", "profit_factor", "max_drawdown",
+                            "stress_return", "stress_pf")}, "consistency": consistency}}
 
     def capture_decisions(self, conn):
         if not self.candidate_history:
@@ -97,11 +102,13 @@ class ResearchReport:
         payload["family_productivity"] = getattr(self, "family_productivity", {})
         payload["candidate_history"] = list(self.candidate_history.values())
         payload["run_id"] = self.run_id
+        payload["context"] = self.context
         payload["unique_quality_candidates_this_run"] = len(self.qualified)
         payload["unique_quality_candidates_per_hour"] = len(self.qualified) * 3600 / elapsed if elapsed > 0 else 0
         payload["sampled_cpu_profile"] = getattr(self, "cpu_profile", {"status": "not_sampled"})
         payload["productivity_scope"] = "research_quality_not_promotion_deduplicated_last_5000_proposals"
         self.directory.mkdir(parents=True, exist_ok=True)
+        payload['long_term_memory'] = research_memory.save(self.directory, payload)
         temp = self.directory / "research-report.tmp"
         temp.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
         temp.replace(self.directory / "research-report.json")

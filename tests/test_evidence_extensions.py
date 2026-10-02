@@ -47,7 +47,7 @@ class EvidenceTests(unittest.TestCase):
                 (root / name).write_text(json.dumps({"updated_at": db.now_iso()}))
             checks = cloud_runtime.monitor_payload(root, status)["checks"]
             self.assertTrue(checks["execution_tape"])
-            self.assertTrue(checks["shadow_replay"])
+            self.assertFalse(checks["shadow_replay"])  # Freshness alone is not agreement.
 
     def test_recording_never_retries_a_failed_trading_cycle(self):
         with tempfile.TemporaryDirectory() as folder, closing(db.connect(":memory:")) as conn:

@@ -131,6 +131,19 @@ def monitor_payload(data_dir, status, now=None):
                                  and all(q.get("available") is True for q in health.get("books", {}).values())
                                  and not health.get("position_gaps"))
         checks["ledger"] = snapshot.get("cash_reconciliation", {}).get("ok") is True
+        if status.get("diagnostics_required"):
+            checks["forward_trials"] = False
+            trials = snapshot.get("forward_trials")
+            if isinstance(trials, list):
+                active = [trial for trial in trials if trial.get("status") == "active"]
+                checks["forward_trials"] = all(
+                    0 <= (now - datetime.fromisoformat(trial["execution"]["at"])).total_seconds() <= 180
+                    and trial.get("cash_reconciliation", {}).get("ok") is True
+                    and not trial["execution"].get("issues")
+                    and not trial["execution"].get("position_gaps")
+                    and all(q.get("available") is True for q in (trial["execution"].get("quotes") or {}).values())
+                    and all(q.get("available") is True for q in (trial["execution"].get("books") or {}).values())
+                    for trial in active)
         research = json.loads((data_dir / "research-report.json").read_text(encoding="utf-8"))
         research_age = (now - datetime.fromisoformat(research["updated_at"])).total_seconds()
         checks["research"] = (research.get("status") in ("running", "success") and 0 <= research_age <= 28800
@@ -138,6 +151,7 @@ def monitor_payload(data_dir, status, now=None):
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass  # Missing/invalid evidence is unhealthy, never a successful empty response.
     if status.get("diagnostics_required"):
+        checks.setdefault("forward_trials", False)
         for name, filename, max_age in (("execution_tape", "execution-tape-status.json", 180),
                                         ("shadow_replay", "shadow-comparison.json", 900)):
             checks[name] = False
@@ -145,6 +159,14 @@ def monitor_payload(data_dir, status, now=None):
                 evidence = json.loads((data_dir / filename).read_text(encoding="utf-8"))
                 observed_age = (now - datetime.fromisoformat(evidence["updated_at"])).total_seconds()
                 checks[name] = 0 <= observed_age <= max_age
+                if name == "shadow_replay":
+                    trials = evidence.get("trials", [])
+                    checks[name] = checks[name] and bool(trials) and all(
+                        trial.get("status") == "comparable" and trial.get("ticks", 0) > 0
+                        and trial.get("baseline_reconciled") is True
+                        and trial.get("challenger_reconciled") is True
+                        and isinstance(trial.get("equity_difference"), (int, float))
+                        and abs(trial["equity_difference"]) <= 1e-8 for trial in trials)
             except (OSError, ValueError, TypeError, KeyError):
                 pass
     contract = None

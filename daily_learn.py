@@ -110,6 +110,9 @@ def main():
         cfg["db_path"] = args.db_path
     conn = db.connect(cfg["db_path"])
     report = research_report.ResearchReport(Path(args.candidate_path).parent)
+    report.context['policy_hash'] = candidate_exchange.policy_hash(cfg)
+    report.context['history_days'] = cfg['history_days']
+    report.context['train_ratio'] = cfg['train_ratio']
     report.save()
     try:
         with indicator_cache.research_cache():

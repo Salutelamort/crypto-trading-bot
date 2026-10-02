@@ -84,3 +84,23 @@ class ExternalMonitorTests(unittest.TestCase):
               mock.patch.object(external_monitor.time, "sleep"), mock.patch("builtins.print")):
             self.assertEqual(external_monitor.main(), 1)
             self.assertEqual(request.call_count, 3)
+
+    def test_fresh_reports_cannot_hide_trial_or_shadow_failure(self):
+        self.status['diagnostics_required'] = True
+        execution = dict(self.snapshot['execution_health'])
+        self.snapshot['forward_trials'] = [{'status': 'active', 'execution': execution,
+                                            'cash_reconciliation': {'ok': True}}]
+        self.write()
+        (self.root / 'execution-tape-status.json').write_text(json.dumps({'updated_at': self.now.isoformat()}))
+        shadow = {'updated_at': self.now.isoformat(), 'trials': [{'status': 'comparable', 'ticks': 6,
+                  'baseline_reconciled': True, 'challenger_reconciled': True, 'equity_difference': 0}]}
+        (self.root / 'shadow-comparison.json').write_text(json.dumps(shadow))
+        self.assertTrue(cloud_runtime.monitor_payload(self.root, self.status, self.now)['ok'])
+        execution['issues'] = ['pending_exit:1:exit_depth_unavailable']
+        self.write()
+        self.assertFalse(cloud_runtime.monitor_payload(self.root, self.status, self.now)['checks']['forward_trials'])
+        execution['issues'] = []
+        self.write()
+        shadow['trials'][0]['equity_difference'] = 1
+        (self.root / 'shadow-comparison.json').write_text(json.dumps(shadow))
+        self.assertFalse(cloud_runtime.monitor_payload(self.root, self.status, self.now)['checks']['shadow_replay'])
