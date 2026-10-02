@@ -2,6 +2,7 @@
 import hashlib
 import json
 import time
+import uuid
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,8 +15,10 @@ class ResearchReport:
         self.directory = Path(directory)
         self.started = time.monotonic()
         self.started_at = db.now_iso()
+        self.run_id = uuid.uuid4().hex
         self.seen = set()
         self.qualified = set()
+        self.candidate_history = {}
         self.counters = Counter()
         self.reasons = Counter()
         self.seconds = Counter()
@@ -47,6 +50,40 @@ class ResearchReport:
         self.seen.add(hashlib.sha256(json.dumps(genome, sort_keys=True).encode()).hexdigest())
         self.counters["training_screen_rejections"] += 1
 
+    def track_candidate(self, agent_id, genome):
+        """Track only intermediate qualifiers; bound memory and persisted output."""
+        canonical = json.dumps(genome, sort_keys=True)
+        if canonical not in self.qualified:
+            return
+        if len(self.candidate_history) >= 256:
+            self.counters["candidate_history_omitted"] += 1
+            return
+        self.candidate_history[agent_id] = {
+            "agent_id": agent_id, "genome": genome,
+            "genome_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+            "qualified_at": db.now_iso(), "status": "candidate", "decisions": []}
+
+    def capture_decisions(self, conn):
+        if not self.candidate_history:
+            return
+        ids = tuple(self.candidate_history)
+        placeholders = ",".join("?" for _ in ids)
+        for aid, status in conn.execute(
+                f"SELECT id,status FROM agents WHERE id IN ({placeholders})", ids):
+            self.candidate_history[aid]["status"] = status
+        # One bounded set scan per generation, not one query per candidate.
+        for row in conn.execute(
+                f"SELECT id,agent_id,ts,backend,action,rationale FROM decisions "
+                f"WHERE agent_id IN ({placeholders}) ORDER BY id", ids):
+            did, aid, stamp, backend, action, reason = row
+            item = self.candidate_history[aid]
+            if did <= item.get("last_decision_id", 0):
+                continue
+            item["last_decision_id"] = did
+            item["decisions"] = (item["decisions"] + [{
+                "at": stamp, "backend": backend, "action": action,
+                "reason": reason[:1200]}])[-8:]
+
     def save(self, status="running"):
         elapsed = time.monotonic() - self.started
         stages = {**self.seconds, "other": max(0, elapsed - sum(self.seconds.values()))}
@@ -58,6 +95,8 @@ class ResearchReport:
                    "evaluations_per_second": self.counters["evaluations"] / elapsed if elapsed > 0 else 0,
                    "delivery": "stored_for_assistant_review_not_pushed_to_chat"}
         payload["family_productivity"] = getattr(self, "family_productivity", {})
+        payload["candidate_history"] = list(self.candidate_history.values())
+        payload["run_id"] = self.run_id
         payload["unique_quality_candidates_this_run"] = len(self.qualified)
         payload["unique_quality_candidates_per_hour"] = len(self.qualified) * 3600 / elapsed if elapsed > 0 else 0
         payload["sampled_cpu_profile"] = getattr(self, "cpu_profile", {"status": "not_sampled"})
@@ -66,12 +105,15 @@ class ResearchReport:
         temp = self.directory / "research-report.tmp"
         temp.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
         temp.replace(self.directory / "research-report.json")
-        if status != "running":
-            history = self.directory / "research-reports"
-            history.mkdir(exist_ok=True)
-            name = "".join(c for c in self.started_at if c.isdigit()) + ".json"
-            (history / name).write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
-            for old in sorted(history.glob("*.json"))[:-32]:
-                old.unlink()
-        print("RESEARCH_REPORT " + json.dumps(payload, allow_nan=False), flush=True)
+        history = self.directory / "research-reports"
+        history.mkdir(exist_ok=True)
+        name = "".join(c for c in self.started_at if c.isdigit()) + "-" + self.run_id + ".json"
+        history_temp = (history / name).with_suffix(".tmp")
+        history_temp.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+        history_temp.replace(history / name)
+        for old in sorted(history.glob("*.json"))[:-32]:
+            old.unlink()
+        # Detailed history stays on disk, not in recurring cloud logs.
+        summary = {key: value for key, value in payload.items() if key != "candidate_history"}
+        print("RESEARCH_REPORT " + json.dumps(summary, allow_nan=False), flush=True)
         return payload

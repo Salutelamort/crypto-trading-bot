@@ -168,6 +168,7 @@ def _learn(conn, cfg, args, report):
     first_decision = conn.execute("SELECT COALESCE(MAX(id),0) FROM decisions").fetchone()[0]
     with report.stage("supervisor"):
         supervisor.supervise(conn, cfg)
+    report.capture_decisions(conn)
     for row in conn.execute("SELECT action,COUNT(*) n FROM decisions WHERE id>? GROUP BY action", (first_decision,)):
         report.counters["supervisor_" + row["action"]] += row["n"]
     if args.research_only:

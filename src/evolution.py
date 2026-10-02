@@ -300,6 +300,8 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
                 for candidate, train, test, consistency in evaluated:
                     aid = db.insert_agent(conn, candidate, candidate["symbol"], candidate["timeframe"], commit=False)
                     db.update_agent_metrics(conn, aid, train, test, consistency, commit=False)
+                    if report:
+                        report.track_candidate(aid, candidate)
                 if screened[0]:
                     previous = int(db.get_runtime_state(conn, "training_screened_trials", "0"))
                     db.set_runtime_state(conn, "training_screened_trials", str(previous + screened[0]), commit=False)
@@ -378,6 +380,7 @@ def evolve(conn, cfg, data_by_key, report=None, cache=None, returns_cache=None):
             cloned = _anti_clone(conn, cfg, data_by_key, returns_cache)
         if report:
             report.counters["correlated_rejections"] += cloned
+            report.capture_decisions(conn)
 
         survivors_now = db.get_agents(conn, "candidate")
         print(f"  Живых агентов: {len(survivors_now)} | убито клонов: {cloned}")
